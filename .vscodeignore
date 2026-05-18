@@ -1,0 +1,7 @@
+**/tsconfig.json
+src/**
+**/node_modules/**
+.vscode-test/**
+.gitignore
+**/bun.lock
+**/*.map

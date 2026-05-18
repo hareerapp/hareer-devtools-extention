@@ -1,0 +1,74 @@
+{
+  "name": "vscode-extension",
+  "displayName": "Hareer Makefile",
+  "description": "GUI to browse and run root Makefile targets in the integrated terminal.",
+  "version": "0.1.0",
+  "publisher": "hareer",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ISCQI/hareer-mono.git",
+    "directory": "apps/vscode-extension"
+  },
+  "icon": "media/favicon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:Makefile"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "vscode:prepublish": "bun run compile",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "hareer.runTarget",
+        "title": "Hareer: Run Make Target"
+      },
+      {
+        "command": "hareer.refresh",
+        "title": "Hareer: Refresh Make Targets",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hareer",
+          "title": "Hareer",
+          "icon": "media/favicon.png"
+        }
+      ]
+    },
+    "views": {
+      "hareer": [
+        {
+          "id": "hareerMakeTargets",
+          "name": "Make Targets"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "hareer.refresh",
+          "when": "view == hareerMakeTargets",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.9.3"
+  }
+}
