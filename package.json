@@ -1,7 +1,7 @@
 {
-  "name": "vscode-extension",
-  "displayName": "Hareer Makefile",
-  "description": "GUI to browse and run root Makefile targets in the integrated terminal.",
+  "name": "hareer-devtools",
+  "displayName": "Hareer DevTools",
+  "description": "Code review and Makefile runner for the Hareer monorepo.",
   "version": "0.1.0",
   "publisher": "hareer",
   "private": true,
@@ -17,8 +17,12 @@
   "categories": [
     "Other"
   ],
+  "extensionDependencies": [
+    "vscode.github-authentication"
+  ],
   "activationEvents": [
-    "workspaceContains:Makefile"
+    "workspaceContains:Makefile",
+    "workspaceContains:.gitmodules"
   ],
   "main": "./dist/extension.js",
   "scripts": {
@@ -35,15 +39,54 @@
       },
       {
         "command": "hareer.refresh",
-        "title": "Hareer: Refresh Make Targets",
+        "title": "Hareer: Refresh Makefile Commands",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "hareer.refreshCodeReview",
+        "title": "Hareer: Refresh Code Review",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hareer.selectPR",
+        "title": "Change Pull Request",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "hareer.openDiff",
+        "title": "Hareer: Open Diff"
+      },
+      {
+        "command": "hareer.postComment",
+        "title": "Submit",
+        "icon": "$(check)"
+      },
+      {
+        "command": "hareer.approveReview",
+        "title": "Approve",
+        "icon": "$(check)"
+      },
+      {
+        "command": "hareer.requestChangesReview",
+        "title": "Request Changes",
+        "icon": "$(request-changes)"
+      },
+      {
+        "command": "hareer.submitReview",
+        "title": "Submit Review",
+        "icon": "$(send)"
+      },
+      {
+        "command": "hareer.mergePR",
+        "title": "Merge Pull Request",
+        "icon": "$(git-merge)"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "hareer",
-          "title": "Hareer",
+          "title": "Hareer DevTools",
           "icon": "media/favicon.png"
         }
       ]
@@ -51,8 +94,12 @@
     "views": {
       "hareer": [
         {
+          "id": "hareerCodeReview",
+          "name": "Code Review"
+        },
+        {
           "id": "hareerMakeTargets",
-          "name": "Make Targets"
+          "name": "Makefile Commands"
         }
       ]
     },
@@ -62,6 +109,47 @@
           "command": "hareer.refresh",
           "when": "view == hareerMakeTargets",
           "group": "navigation"
+        },
+        {
+          "command": "hareer.refreshCodeReview",
+          "when": "view == hareerCodeReview",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "hareer.selectPR",
+          "when": "view == hareerCodeReview && viewItem == prSelectorActive",
+          "group": "inline@1"
+        },
+        {
+          "command": "hareer.submitReview",
+          "when": "view == hareerCodeReview && viewItem == prSelectorActive",
+          "group": "inline@2"
+        },
+        {
+          "command": "hareer.mergePR",
+          "when": "view == hareerCodeReview && viewItem == prSelectorActive",
+          "group": "inline@3"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "hareer.postComment",
+          "when": "commentController == hareerReview",
+          "group": "inline"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "hareer.approveReview",
+          "when": "commentController == hareerReview",
+          "group": "navigation@1"
+        },
+        {
+          "command": "hareer.requestChangesReview",
+          "when": "commentController == hareerReview",
+          "group": "navigation@2"
         }
       ]
     }
