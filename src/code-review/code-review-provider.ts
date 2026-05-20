@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { fetchOpenPRs, fetchPRFiles } from "./github-api";
+import { checkoutPRBranch } from "./git-checkout";
 import type { PRFile, PullRequest, Submodule } from "./types";
 
 export type CodeReviewNode =
@@ -174,7 +175,9 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     st.files = files;
     st.folderTree = buildFolderTree(files);
     st.loading = false;
-    this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
+    this._onDidChangeTreeData.fire(undefined);
+
+    await checkoutPRBranch(submodule, selectedPR.headRef);
   }
 
   private ensureState(submodule: Submodule): SubmoduleState {
