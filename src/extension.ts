@@ -6,7 +6,7 @@ import { disposeHareerTerminal, runMakeTarget } from "./terminal-runner";
 import { CodeReviewProvider } from "./code-review/code-review-provider";
 import type { CodeReviewNode } from "./code-review/code-review-provider";
 import { HareerCommentProvider } from "./code-review/comment-provider";
-import { buildHeadUri, openDiff, cleanupTempFiles } from "./code-review/diff-provider";
+import { openDiff, cleanupTempFiles } from "./code-review/diff-provider";
 import { parseGitmodules } from "./code-review/submodule-parser";
 import { invalidateToken, mergePR } from "./code-review/github-api";
 
@@ -150,14 +150,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       "hareer.openDiff",
       async (node: CodeReviewNode | undefined) => {
         if (!node || node.kind !== "file") return;
-        await openDiff(node, async (submodule, pr, file, headSha) => {
-          await commentProvider.loadCommentsForFile(
-            submodule,
-            pr,
-            file,
-            headSha,
-            buildHeadUri(file.filename),
-          );
+        await openDiff(node, async (submodule, pr, file, headSha, headUri) => {
+          await commentProvider.loadCommentsForFile(submodule, pr, file, headSha, headUri);
         });
       },
     ),

@@ -19,13 +19,6 @@ function writeTempFile(prefix: string, content: string): string {
   return filePath;
 }
 
-/** Returns the deterministic VS Code URI for the HEAD temp file of a given filename. */
-export function buildHeadUri(filename: string): vscode.Uri {
-  const safeName = sanitizePath(filename);
-  const ext = path.extname(filename);
-  return vscode.Uri.file(path.join(os.tmpdir(), `hareer-head-${safeName}${ext ? "" : ".txt"}`));
-}
-
 export function cleanupTempFiles(): void {
   for (const f of tempFiles) {
     try {
@@ -39,11 +32,12 @@ export function cleanupTempFiles(): void {
 
 export async function openDiff(
   node: CodeReviewNode,
-  onFileOpened: (
+  onBeforeDiffOpen: (
     submodule: Submodule,
     pr: PullRequest,
     file: PRFile,
     headSha: string,
+    headUri: vscode.Uri,
   ) => Promise<void>,
 ): Promise<void> {
   if (node.kind !== "file") return;
@@ -82,11 +76,12 @@ export async function openDiff(
       const baseUri = vscode.Uri.file(baseFile);
       const headUri = vscode.Uri.file(headFile);
 
+      // Register comments BEFORE opening the diff so provideCommentingRanges
+      // sees the URI when VS Code queries it during editor activation.
+      await onBeforeDiffOpen(submodule, pr, file, pr.headSha, headUri);
+
       const title = `${path.basename(file.filename)} (${pr.baseRef} ↔ ${pr.headRef})`;
-
       await vscode.commands.executeCommand("vscode.diff", baseUri, headUri, title);
-
-      await onFileOpened(submodule, pr, file, pr.headSha);
     },
   );
 }
