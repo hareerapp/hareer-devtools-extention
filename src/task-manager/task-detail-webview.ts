@@ -666,6 +666,8 @@ export class TaskDetailPanel {
         name: r.name,
         path: r.path,
         isSubmodule: r.isSubmodule,
+        owner: r.owner,
+        repo: r.repo,
       })),
       branchMatches: this.state.branchMatches.map((b) => ({
         repoName: b.repoName,
@@ -880,21 +882,21 @@ h2:first-child { margin-top: 0; }
 .tag-list { display: flex; gap: 6px; flex-wrap: wrap; }
 .tag-chip { padding: 2px 8px; border-radius: 10px; font-size: 0.72rem; font-weight: 500; border: 1px solid; }
 
-/* ------- Header action buttons ------- */
-.header .actions { display: inline-flex; gap: 6px; align-items: center; margin-left: 4px; }
-.header-btn {
+/* ------- Task action buttons (under description) ------- */
+.task-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.action-btn {
   display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600;
+  padding: 6px 12px; border-radius: 12px; font-size: 0.78rem; font-weight: 600;
   border: 1px solid var(--vscode-button-border, transparent); cursor: pointer;
   background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);
   font-family: inherit;
 }
-.header-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
-.header-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-.header-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
-.header-btn:disabled { opacity: 0.55; cursor: not-allowed; }
-.header-btn .count { background: rgba(255,255,255,0.15); padding: 0 5px; border-radius: 8px; font-size: 0.7rem; }
-.header-btn.primary .count { background: rgba(255,255,255,0.25); }
+.action-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.action-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.action-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+.action-btn .count { background: rgba(255,255,255,0.15); padding: 0 5px; border-radius: 8px; font-size: 0.7rem; }
+.action-btn.primary .count { background: rgba(255,255,255,0.25); }
+.collapsible-section { margin-top: 8px; }
 
 /* ------- Description with fade + expand ------- */
 .description-empty { color: var(--hareer-muted); font-style: italic; }
@@ -1005,7 +1007,7 @@ const WEBVIEW_JS = `
 const vscode = acquireVsCodeApi();
 const root = document.getElementById("root");
 let model = null;
-let savedState = vscode.getState() || { commitSubject: "", commitScope: "", commitBody: "", commitType: "feat", branchType: null, stageAll: true, selectedRepoPaths: null, descriptionExpanded: false };
+let savedState = vscode.getState() || { commitSubject: "", commitScope: "", commitBody: "", commitType: "feat", branchType: null, stageAll: true, selectedRepoPaths: null, descriptionExpanded: false, showCommitSection: false, showPRSection: false, showBranchSection: false };
 
 function escape(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]));
@@ -1191,15 +1193,33 @@ function render() {
       (t.timeEstimateMs ? 'Estimate: ' + fmtDuration(t.timeEstimateMs) : '') + '</div>'
     : '<div class="empty">Not tracked</div>';
 
-  // Header action buttons — discovered via context discovery (branches in repos, PRs)
+  // Context-driven action buttons (under description)
   const branchCount = (model.branchMatches || []).length;
   const prCount = (model.prMatches || []).length;
-  const checkoutBtn = '<button class="header-btn primary" id="header-checkout" ' +
-    (branchCount === 0 ? 'disabled title="No branch found containing this task id"' : 'title="Checkout matching branch in ' + branchCount + ' repo' + (branchCount === 1 ? '' : 's') + '"') +
-    '>⤓ Checkout' + (branchCount > 0 ? ' <span class="count">' + branchCount + '</span>' : '') + '</button>';
-  const reviewBtn = prCount > 0
-    ? '<button class="header-btn primary" id="header-review" title="Open code review for ' + prCount + ' matching PR' + (prCount === 1 ? '' : 's') + '">👁 Code Review <span class="count">' + prCount + '</span></button>'
-    : '';
+  if (branchCount > 0) savedState.showBranchSection = false;
+
+  const actionBtns = [];
+  if (branchCount > 0) {
+    actionBtns.push(
+      '<button class="action-btn primary" id="action-checkout" title="Checkout matching branch in ' + branchCount + ' repo' + (branchCount === 1 ? '' : 's') + '">' +
+        '⤓ Checkout' + (branchCount > 1 ? ' <span class="count">' + branchCount + '</span>' : '') +
+      '</button>',
+    );
+  } else {
+    actionBtns.push('<button class="action-btn primary" id="action-create-branch">＋ Create Branch</button>');
+  }
+  if (branchCount > 0 && prCount === 0 && !linked) {
+    actionBtns.push('<button class="action-btn" id="action-create-pr">Create PR</button>');
+  }
+  if (prCount > 0) {
+    actionBtns.push(
+      '<button class="action-btn primary" id="action-review" title="Open code review for ' + prCount + ' matching PR' + (prCount === 1 ? '' : 's') + '">' +
+        '👁 Code Review <span class="count">' + prCount + '</span>' +
+      '</button>',
+    );
+  }
+  actionBtns.push('<button class="action-btn" id="action-commit">Commit</button>');
+  const actionsHtml = '<div class="task-actions">' + actionBtns.join('') + '</div>';
 
   // Determine which repos are selected for branch creation. Default: all submodules
   // (or the single workspace repo if no .gitmodules).
@@ -1209,25 +1229,11 @@ function render() {
   if (savedState.selectedRepoPaths === null) {
     savedState.selectedRepoPaths = repoPool.map((r) => r.path);
   } else {
-    // Drop selections that don't exist (e.g. submodule removed)
     const valid = new Set(repoPool.map((r) => r.path));
     savedState.selectedRepoPaths = (savedState.selectedRepoPaths || []).filter((p) => valid.has(p));
   }
   const isSelected = (p) => (savedState.selectedRepoPaths || []).includes(p);
 
-  // Description with optional fade + expand toggle
-  const hasDesc = t.description && t.description.trim();
-  const descBody = hasDesc
-    ? '<div class="description-wrap" id="desc-wrap">' +
-        '<div class="card description-clip' + (savedState.descriptionExpanded ? ' expanded' : '') + '" id="desc-clip">' +
-          renderMarkdown(t.description) +
-        '</div>' +
-        '<div class="description-fade"></div>' +
-        '<button class="description-toggle" id="desc-toggle">' + (savedState.descriptionExpanded ? '▲ Show less' : '▼ Show more') + '</button>' +
-      '</div>'
-    : '<div class="card description-empty">No description provided.</div>';
-
-  // PR section — repo pills only shown when not linked AND we have multiple submodules to pick
   const repoPillsHtml = submoduleRepos.length > 0
     ? '<div class="row" style="flex-direction:column;align-items:flex-start;gap:6px">' +
         '<label style="margin:0">Repos</label>' +
@@ -1241,26 +1247,37 @@ function render() {
       '</div>'
     : '';
 
-  root.innerHTML =
-    '<div class="task-layout">' +
-      '<div class="header">' +
-        '<div class="title">' + escape(t.name) + ' <span class="number">CU ' + escape(t.customId) + '</span> ' + statusBadge + ' ' + priorityBadge +
-          ' <span class="actions">' + checkoutBtn + reviewBtn + '</span>' +
+  // Description with optional fade + expand toggle
+  const hasDesc = t.description && t.description.trim();
+  const descBody = hasDesc
+    ? '<div class="description-wrap" id="desc-wrap">' +
+        '<div class="card description-clip' + (savedState.descriptionExpanded ? ' expanded' : '') + '" id="desc-clip">' +
+          renderMarkdown(t.description) +
         '</div>' +
-        '<div class="meta">' +
-          '<span class="path-crumbs">' + crumbs + '</span>' +
-          (t.creator ? '<span>· created by ' + escape(t.creator) + '</span>' : '') +
-          (t.createdAt ? '<span>· ' + escape(fmtDate(t.createdAt)) + '</span>' : '') +
-          (t.updatedAt ? '<span>· updated ' + escape(fmtDate(t.updatedAt)) + '</span>' : '') +
-          '<span>· <a href="' + escape(t.url) + '" data-external="1">Open in ClickUp ↗</a></span>' +
-          '<button class="secondary icon-only" id="refresh-btn" title="Refresh">⟳</button>' +
+        '<div class="description-fade"></div>' +
+        '<button class="description-toggle" id="desc-toggle">' + (savedState.descriptionExpanded ? '▲ Show less' : '▼ Show more') + '</button>' +
+      '</div>'
+    : '<div class="card description-empty">No description provided.</div>';
+
+  const branchSectionHtml = savedState.showBranchSection && branchCount === 0
+    ? '<div class="collapsible-section">' +
+        '<h2>Create Branch</h2>' +
+        '<div class="pr-card">' +
+          '<div class="row">' +
+            '<label>Type</label>' +
+            '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
+              branchTypes.map((bt) => '<button class="chip ' + (savedState.branchType === bt ? "active" : "") + '" data-bt="' + escape(bt) + '">' + escape(bt) + '</button>').join('') +
+            '</div>' +
+          '</div>' +
+          repoPillsHtml +
+          '<div class="preview" id="branch-preview"></div>' +
+          '<div class="row" style="margin-top:10px"><button class="primary" id="create-branch-btn">Create branch & checkout</button></div>' +
         '</div>' +
-      '</div>' +
+      '</div>'
+    : '';
 
-      '<div class="main">' +
-        '<h2>Description</h2>' +
-        descBody +
-
+  const prSectionHtml = savedState.showPRSection
+    ? '<div class="collapsible-section">' +
         '<h2>GitHub PR</h2>' +
         '<div class="pr-card">' +
           (linked ? (
@@ -1276,18 +1293,29 @@ function render() {
               '<button class="secondary" id="relink-btn">Replace link…</button>' +
             '</div>'
           ) : (
-            '<div class="row">' +
-              '<label>Type</label>' +
-              '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
-                branchTypes.map((bt) => '<button class="chip ' + (savedState.branchType === bt ? "active" : "") + '" data-bt="' + escape(bt) + '">' + escape(bt) + '</button>').join('') +
-              '</div>' +
-            '</div>' +
-            repoPillsHtml +
-            '<div class="preview" id="branch-preview"></div>' +
-            '<div class="row" style="margin-top:10px"><button class="primary" id="create-branch-btn">Create branch & checkout</button></div>'
+            '<p class="muted" style="margin:0 0 10px">Open GitHub to create a pull request, then link it to this task.</p>' +
+            (model.branchMatches || []).map((b) => {
+              const repo = (model.repos || []).find((r) => r.path === b.repoPath);
+              const gh = repo && repo.owner && repo.repo
+                ? 'https://github.com/' + encodeURIComponent(repo.owner) + '/' + encodeURIComponent(repo.repo) + '/pull/new/' + encodeURIComponent(b.branch)
+                : '';
+              return '<div class="row">' +
+                '<span><strong>' + escape(b.repoName) + '</strong> · <code>' + escape(b.branch) + '</code></span>' +
+                (gh ? '<a href="' + escape(gh) + '" data-external="1" style="margin-left:auto;color:var(--vscode-textLink-foreground);text-decoration:none;font-size:0.85rem">Open Create PR ↗</a>' : '') +
+              '</div>';
+            }).join('') +
+            '<div class="row" style="margin-top:12px;flex-wrap:nowrap">' +
+              '<label style="flex-shrink:0">Link PR</label>' +
+              '<input type="text" id="link-pr-input" placeholder="https://github.com/owner/repo/pull/123" style="flex:1" />' +
+              '<button class="primary" id="link-pr-btn" style="flex-shrink:0">Link</button>' +
+            '</div>'
           )) +
         '</div>' +
+      '</div>'
+    : '';
 
+  const commitSectionHtml = savedState.showCommitSection
+    ? '<div class="collapsible-section">' +
         '<h2>Commit</h2>' +
         '<div class="card">' +
           '<div class="commit-grid">' +
@@ -1318,6 +1346,30 @@ function render() {
             '<span>' + model.dirty.staged + ' staged · ' + model.dirty.unstaged + ' unstaged' + (model.dirty.staged + model.dirty.unstaged === 0 ? ' <span class="clean">✓ clean</span>' : '') + '</span>' +
           '</div>' : '') +
         '</div>' +
+      '</div>'
+    : '';
+
+  root.innerHTML =
+    '<div class="task-layout">' +
+      '<div class="header">' +
+        '<div class="title">' + escape(t.name) + ' <span class="number">CU ' + escape(t.customId) + '</span> ' + statusBadge + ' ' + priorityBadge + '</div>' +
+        '<div class="meta">' +
+          '<span class="path-crumbs">' + crumbs + '</span>' +
+          (t.creator ? '<span>· created by ' + escape(t.creator) + '</span>' : '') +
+          (t.createdAt ? '<span>· ' + escape(fmtDate(t.createdAt)) + '</span>' : '') +
+          (t.updatedAt ? '<span>· updated ' + escape(fmtDate(t.updatedAt)) + '</span>' : '') +
+          '<span>· <a href="' + escape(t.url) + '" data-external="1">Open in ClickUp ↗</a></span>' +
+          '<button class="secondary icon-only" id="refresh-btn" title="Refresh">⟳</button>' +
+        '</div>' +
+      '</div>' +
+
+      '<div class="main">' +
+        '<h2>Description</h2>' +
+        descBody +
+        actionsHtml +
+        branchSectionHtml +
+        prSectionHtml +
+        commitSectionHtml +
       '</div>' +
 
       '<div class="sidebar">' +
@@ -1416,11 +1468,28 @@ function bindEvents() {
   const checkout = document.getElementById("checkout-btn");
   if (checkout) checkout.addEventListener("click", () => vscode.postMessage({ type: "checkoutLinkedPR" }));
 
-  // Header buttons
-  const headerCheckout = document.getElementById("header-checkout");
-  if (headerCheckout) headerCheckout.addEventListener("click", () => vscode.postMessage({ type: "checkoutTaskBranches" }));
-  const headerReview = document.getElementById("header-review");
-  if (headerReview) headerReview.addEventListener("click", () => vscode.postMessage({ type: "openTaskReview" }));
+  const actionCheckout = document.getElementById("action-checkout");
+  if (actionCheckout) actionCheckout.addEventListener("click", () => vscode.postMessage({ type: "checkoutTaskBranches" }));
+  const actionCreateBranch = document.getElementById("action-create-branch");
+  if (actionCreateBranch) actionCreateBranch.addEventListener("click", () => {
+    savedState.showBranchSection = true;
+    saveDraft();
+    render();
+  });
+  const actionCreatePR = document.getElementById("action-create-pr");
+  if (actionCreatePR) actionCreatePR.addEventListener("click", () => {
+    savedState.showPRSection = true;
+    saveDraft();
+    render();
+  });
+  const actionReview = document.getElementById("action-review");
+  if (actionReview) actionReview.addEventListener("click", () => vscode.postMessage({ type: "openTaskReview" }));
+  const actionCommit = document.getElementById("action-commit");
+  if (actionCommit) actionCommit.addEventListener("click", () => {
+    savedState.showCommitSection = true;
+    saveDraft();
+    render();
+  });
 
   // Repo multi-select pills
   document.querySelectorAll("[data-repo]").forEach((el) => {
@@ -1478,6 +1547,14 @@ function bindEvents() {
   if (relink) relink.addEventListener("click", () => {
     const url = prompt("Paste new GitHub PR URL", model.linkedPR ? model.linkedPR.url : "");
     if (url) vscode.postMessage({ type: "linkPR", url: url.trim() });
+  });
+
+  const linkPrBtn = document.getElementById("link-pr-btn");
+  if (linkPrBtn) linkPrBtn.addEventListener("click", () => {
+    const input = document.getElementById("link-pr-input");
+    const url = input ? input.value.trim() : "";
+    if (!url) { flash("Paste a GitHub PR URL first."); return; }
+    vscode.postMessage({ type: "linkPR", url: url });
   });
 }
 
