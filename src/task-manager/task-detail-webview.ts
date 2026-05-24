@@ -75,6 +75,12 @@ interface PanelState {
   prMatches: PRMatch[];
 }
 
+interface TaskPRQuickPickItem extends vscode.QuickPickItem {
+  pr?: PRMatch;
+}
+
+const REVIEW_ALL_PRS_LABEL = "$(list-selection) Review All";
+
 // ============================================================================
 // Panel
 // ============================================================================
@@ -383,33 +389,49 @@ export class TaskDetailPanel {
       }
     }
 
-    let target = prs[0];
-    if (prs.length > 1) {
-      const picked = await vscode.window.showQuickPick(
-        prs.map((p) => ({
+    if (prs.length === 1) {
+      await this.showPRInCodeReview(prs[0]);
+      return;
+    }
+
+    const picked = await vscode.window.showQuickPick<TaskPRQuickPickItem>(
+      [
+        {
+          label: REVIEW_ALL_PRS_LABEL,
+          description: `Open all ${prs.length} matching pull requests`,
+          alwaysShow: true,
+        },
+        ...prs.map((p) => ({
           label: `#${p.prNumber} · ${p.title}`,
           description: `${p.owner}/${p.repo}`,
           pr: p,
         })),
-        { placeHolder: "Multiple PRs match this task — pick one to review" },
-      );
-      if (!picked) return;
-      target = picked.pr;
+      ],
+      { placeHolder: "Multiple PRs match this task — pick one to review" },
+    );
+    if (!picked) return;
+    if (picked.label === REVIEW_ALL_PRS_LABEL) {
+      for (const p of prs) {
+        await this.showPRInCodeReview(p);
+      }
+      return;
     }
+    if (!picked.pr) return;
+    await this.showPRInCodeReview(picked.pr);
+  }
 
-    // Route into the existing Code Review tree section (focuses the view,
-    // selects the PR, fetches files — without opening the standalone PR
-    // detail webview panel).
+  /** Route a matched PR into the Code Review tree (no standalone detail panel). */
+  private async showPRInCodeReview(match: PRMatch): Promise<void> {
     await vscode.commands.executeCommand(
       "hareer.showPRInCodeReview",
       {
-        name: target.repoName,
-        path: target.repoPath,
-        url: `https://github.com/${target.owner}/${target.repo}`,
-        owner: target.owner,
-        repo: target.repo,
+        name: match.repoName,
+        path: match.repoPath,
+        url: `https://github.com/${match.owner}/${match.repo}`,
+        owner: match.owner,
+        repo: match.repo,
       },
-      target.prNumber,
+      match.prNumber,
     );
   }
 
