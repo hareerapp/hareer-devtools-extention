@@ -1,13 +1,20 @@
 import type { Submodule } from "./types";
 
+function stripRepoSuffix(raw: string): string {
+  let out = raw.trim().replace(/\/+$/, "");
+  if (out.toLowerCase().endsWith(".git")) out = out.slice(0, -4);
+  return out;
+}
+
 function parseGitHubOwnerRepo(url: string): { owner: string; repo: string } | undefined {
-  const sshMatch = url.match(/git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
+  const cleaned = url.trim();
+  const sshMatch = cleaned.match(/^(?:ssh:\/\/)?git@github\.com[:/]([^/]+)\/(.+)$/);
   if (sshMatch) {
-    return { owner: sshMatch[1], repo: sshMatch[2] };
+    return { owner: sshMatch[1], repo: stripRepoSuffix(sshMatch[2]) };
   }
-  const httpsMatch = url.match(/https?:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
+  const httpsMatch = cleaned.match(/^https?:\/\/(?:[^@/]+@)?github\.com\/([^/]+)\/(.+)$/);
   if (httpsMatch) {
-    return { owner: httpsMatch[1], repo: httpsMatch[2] };
+    return { owner: httpsMatch[1], repo: stripRepoSuffix(httpsMatch[2]) };
   }
   return undefined;
 }

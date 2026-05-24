@@ -66,6 +66,13 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
   private submodules: Submodule[] = [];
   private readonly state = new Map<string, SubmoduleState>();
+  private pendingCountFor: (submodule: Submodule, pr: PullRequest) => number = () => 0;
+
+  setPendingCountResolver(
+    resolver: (submodule: Submodule, pr: PullRequest) => number,
+  ): void {
+    this.pendingCountFor = resolver;
+  }
 
   setSubmodules(submodules: Submodule[]): void {
     this.submodules = submodules;
@@ -226,14 +233,17 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
             st.files.length > 0
               ? vscode.TreeItemCollapsibleState.Expanded
               : vscode.TreeItemCollapsibleState.None;
+          const pendingCount = this.pendingCountFor(node.submodule, selectedPR);
           const item = new vscode.TreeItem(
             `#${selectedPR.number}: ${selectedPR.title}`,
             collapsible,
           );
           item.iconPath = new vscode.ThemeIcon("git-pull-request");
-          item.description = `${selectedPR.baseRef} ← ${selectedPR.headRef}`;
+          const baseDesc = `${selectedPR.baseRef} ← ${selectedPR.headRef}`;
+          item.description =
+            pendingCount > 0 ? `${baseDesc}  ·  ${pendingCount} pending` : baseDesc;
           item.tooltip = selectedPR.url;
-          item.contextValue = "prSelectorActive";
+          item.contextValue = pendingCount > 0 ? "prSelectorActivePending" : "prSelectorActive";
           item.command = {
             command: "hareer.selectPR",
             title: "Change Pull Request",

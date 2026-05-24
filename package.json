@@ -47,6 +47,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "hareer.reconnectGitHub",
+        "title": "Hareer: Reconnect GitHub (fix 401/404 scope issues)",
+        "icon": "$(sign-in)"
+      },
+      {
         "command": "hareer.selectPR",
         "title": "Change Pull Request",
         "icon": "$(edit)"
@@ -79,6 +84,16 @@
         "command": "hareer.mergePR",
         "title": "Merge Pull Request",
         "icon": "$(git-merge)"
+      },
+      {
+        "command": "hareer.discardReview",
+        "title": "Discard Pending Review",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "hareer.deletePendingComment",
+        "title": "Remove Pending Comment",
+        "icon": "$(trash)"
       },
       {
         "command": "hareer.connectClickUp",
@@ -162,24 +177,36 @@
       "view/item/context": [
         {
           "command": "hareer.selectPR",
-          "when": "view == hareerCodeReview && viewItem == prSelectorActive",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive/",
           "group": "inline@1"
         },
         {
           "command": "hareer.submitReview",
-          "when": "view == hareerCodeReview && viewItem == prSelectorActive",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive/",
           "group": "inline@2"
         },
         {
-          "command": "hareer.mergePR",
-          "when": "view == hareerCodeReview && viewItem == prSelectorActive",
+          "command": "hareer.discardReview",
+          "when": "view == hareerCodeReview && viewItem == prSelectorActivePending",
           "group": "inline@3"
+        },
+        {
+          "command": "hareer.mergePR",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive/",
+          "group": "inline@4"
         }
       ],
       "comments/commentThread/context": [
         {
           "command": "hareer.postComment",
           "when": "commentController == hareerReview",
+          "group": "inline"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "hareer.deletePendingComment",
+          "when": "commentController == hareerReview && comment == pendingComment",
           "group": "inline"
         }
       ],

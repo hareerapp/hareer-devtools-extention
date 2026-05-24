@@ -44,6 +44,14 @@ export interface ReviewComment {
   readonly createdAt: string;
   readonly diffHunk: string;
   readonly commitId: string;
+  readonly inReplyToId?: number;
+}
+
+export interface ReviewLineComment {
+  readonly path: string;
+  readonly line: number;
+  readonly side: "LEFT" | "RIGHT";
+  readonly body: string;
 }
 
 export interface SubmitReviewPayload {
@@ -52,9 +60,5 @@ export interface SubmitReviewPayload {
   readonly pullNumber: number;
   readonly event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
   readonly body: string;
-  readonly comments: ReadonlyArray<{
-    readonly path: string;
-    readonly position: number;
-    readonly body: string;
-  }>;
+  readonly comments: readonly ReviewLineComment[];
 }

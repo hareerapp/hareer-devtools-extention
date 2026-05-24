@@ -8,7 +8,7 @@ import type { CodeReviewNode } from "./code-review/code-review-provider";
 import { HareerCommentProvider } from "./code-review/comment-provider";
 import { openDiff, cleanupTempFiles } from "./code-review/diff-provider";
 import { parseGitmodules } from "./code-review/submodule-parser";
-import { invalidateToken, mergePR } from "./code-review/github-api";
+import { invalidateToken, mergePR, reconnectGitHub } from "./code-review/github-api";
 import { syncConnectedContext } from "./task-manager/auth";
 import { TaskService } from "./task-manager/task-service";
 import { TaskTreeProvider } from "./task-manager/task-tree-provider";
@@ -79,6 +79,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
 
   const commentProvider = new HareerCommentProvider();
+  codeReviewProvider.setPendingCountResolver((submodule, pr) =>
+    commentProvider.pendingCountFor(submodule, pr),
+  );
 
   async function loadSubmodules(): Promise<void> {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
@@ -154,6 +157,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       invalidateToken();
       await loadSubmodules();
       codeReviewProvider.refresh();
+    }),
+
+    vscode.commands.registerCommand("hareer.reconnectGitHub", async () => {
+      try {
+        await reconnectGitHub();
+        await loadSubmodules();
+        codeReviewProvider.refresh();
+        void vscode.window.showInformationMessage("Hareer: GitHub reconnected.");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        void vscode.window.showErrorMessage(`Hareer: GitHub reconnect failed — ${msg}`);
+      }
     }),
 
     vscode.commands.registerCommand(
@@ -256,6 +271,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("hareer.postComment", async (reply: vscode.CommentReply) => {
       await commentProvider.handlePostComment(reply);
     }),
+
+    vscode.commands.registerCommand(
+      "hareer.discardReview",
+      async (node: CodeReviewNode | undefined) => {
+        if (!node || node.kind !== "prSelector") {
+          void vscode.window.showWarningMessage("Hareer: Select a pull request row first.");
+          return;
+        }
+        const selectedPR = codeReviewProvider.getSelectedPR(node.submodule);
+        if (!selectedPR) return;
+        await commentProvider.promptDiscardReview(node.submodule, selectedPR);
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      "hareer.deletePendingComment",
+      async (thread: vscode.CommentThread | undefined) => {
+        if (!thread) return;
+        await commentProvider.deletePendingComment(thread);
+      },
+    ),
+
+    commentProvider.onDidChangePending(() => codeReviewProvider.refresh()),
 
     vscode.commands.registerCommand("hareer.approveReview", async (thread: vscode.CommentThread) => {
       await commentProvider.handleSubmitReviewFromThread(thread, "APPROVE");

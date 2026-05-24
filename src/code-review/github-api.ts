@@ -21,6 +21,20 @@ export function invalidateToken(): void {
   cachedToken = undefined;
 }
 
+/**
+ * Force a fresh GitHub sign-in dialog. Use this when the cached session was
+ * granted with insufficient scopes (e.g. no access to private repos).
+ */
+export async function reconnectGitHub(): Promise<void> {
+  cachedToken = undefined;
+  const session = await vscode.authentication.getSession(
+    GITHUB_AUTH_PROVIDER,
+    GITHUB_SCOPES,
+    { forceNewSession: true },
+  );
+  cachedToken = session.accessToken;
+}
+
 function githubRequest<T>(
   method: string,
   path: string,
@@ -54,8 +68,14 @@ function githubRequest<T>(
         try {
           const parsed = JSON.parse(raw) as T;
           if (res.statusCode !== undefined && res.statusCode >= 400) {
-            const msg = (parsed as { message?: string }).message ?? `HTTP ${res.statusCode}`;
-            reject(new Error(`GitHub API error: ${msg}`));
+            const baseMsg = (parsed as { message?: string }).message ?? `HTTP ${res.statusCode}`;
+            const hint =
+              res.statusCode === 404
+                ? ` — verify the repo exists and your GitHub token has access to https://github.com${path.split("?")[0].replace("/repos", "")}`
+                : res.statusCode === 401
+                  ? " — your GitHub token is invalid or lacks the 'repo' scope"
+                  : "";
+            reject(new Error(`GitHub API error (${res.statusCode}): ${baseMsg}${hint}`));
           } else {
             resolve(parsed);
           }
@@ -99,6 +119,7 @@ interface RawComment {
   created_at: string;
   diff_hunk: string;
   commit_id: string;
+  in_reply_to_id?: number;
 }
 
 interface RawContents {
@@ -185,7 +206,36 @@ export async function fetchPRComments(
     createdAt: c.created_at,
     diffHunk: c.diff_hunk,
     commitId: c.commit_id,
+    inReplyToId: c.in_reply_to_id,
   }));
+}
+
+export async function replyToReviewComment(
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  inReplyToId: number,
+  body: string,
+): Promise<ReviewComment> {
+  const token = await getToken();
+  const raw = await githubRequest<RawComment>(
+    "POST",
+    `/repos/${owner}/${repo}/pulls/${pullNumber}/comments`,
+    token,
+    { body, in_reply_to: inReplyToId },
+  );
+  return {
+    id: raw.id,
+    body: raw.body,
+    path: raw.path,
+    line: raw.line ?? raw.original_line ?? 1,
+    side: (raw.side === "LEFT" ? "LEFT" : "RIGHT") as "LEFT" | "RIGHT",
+    user: raw.user.login,
+    createdAt: raw.created_at,
+    diffHunk: raw.diff_hunk,
+    commitId: raw.commit_id,
+    inReplyToId: raw.in_reply_to_id,
+  };
 }
 
 export async function fetchFileContent(
@@ -239,7 +289,12 @@ export async function submitReview(payload: SubmitReviewPayload): Promise<void> 
     {
       body: payload.body,
       event: payload.event,
-      comments: payload.comments,
+      comments: payload.comments.map((c) => ({
+        path: c.path,
+        line: c.line,
+        side: c.side,
+        body: c.body,
+      })),
     },
   );
 }
