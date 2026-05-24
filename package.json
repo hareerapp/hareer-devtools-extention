@@ -1,7 +1,7 @@
 {
   "name": "hareer-devtools",
   "displayName": "Hareer DevTools",
-  "description": "Code review and Makefile runner for the Hareer monorepo.",
+  "description": "ClickUp task manager, code review, and Makefile runner for the Hareer monorepo.",
   "version": "0.1.0",
   "publisher": "hareer",
   "private": true,
@@ -28,7 +28,6 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
-    "vscode:prepublish": "bun run compile",
     "typecheck": "tsc --noEmit -p ."
   },
   "contributes": {
@@ -80,6 +79,29 @@
         "command": "hareer.mergePR",
         "title": "Merge Pull Request",
         "icon": "$(git-merge)"
+      },
+      {
+        "command": "hareer.connectClickUp",
+        "title": "Hareer: Connect ClickUp",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "hareer.disconnectClickUp",
+        "title": "Hareer: Disconnect ClickUp"
+      },
+      {
+        "command": "hareer.switchClickUpWorkspace",
+        "title": "Hareer: Switch ClickUp Workspace",
+        "icon": "$(organization)"
+      },
+      {
+        "command": "hareer.refreshTasks",
+        "title": "Hareer: Refresh Tasks",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hareer.openTaskDetail",
+        "title": "Hareer: Open Task Detail"
       }
     ],
     "viewsContainers": {
@@ -94,6 +116,10 @@
     "views": {
       "hareer": [
         {
+          "id": "hareerTaskManager",
+          "name": "Task Manager"
+        },
+        {
           "id": "hareerCodeReview",
           "name": "Code Review"
         },
@@ -103,6 +129,13 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "hareerTaskManager",
+        "contents": "Connect your ClickUp account to see tasks assigned to you.\n[Connect ClickUp](command:hareer.connectClickUp)\n\nYou'll need a Personal API Token from ClickUp: avatar → Settings → Apps, or Workspace Settings → ClickUp API.",
+        "when": "!hareer.clickup.connected"
+      }
+    ],
     "menus": {
       "view/title": [
         {
@@ -114,6 +147,16 @@
           "command": "hareer.refreshCodeReview",
           "when": "view == hareerCodeReview",
           "group": "navigation"
+        },
+        {
+          "command": "hareer.refreshTasks",
+          "when": "view == hareerTaskManager && hareer.clickup.connected",
+          "group": "navigation@1"
+        },
+        {
+          "command": "hareer.switchClickUpWorkspace",
+          "when": "view == hareerTaskManager && hareer.clickup.connected",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -152,6 +195,32 @@
           "group": "navigation@2"
         }
       ]
+    },
+    "configuration": {
+      "title": "Hareer DevTools",
+      "properties": {
+        "hareer.clickup.prUrlFieldName": {
+          "type": "string",
+          "default": "Github PR Url",
+          "description": "Name of the ClickUp custom field that holds the GitHub PR URL."
+        },
+        "hareer.clickup.autoTransition": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically move ClickUp tasks between statuses when you create branches and push."
+        },
+        "hareer.clickup.branchTypes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["feature", "bugfix", "hotfix", "chore", "docs", "refactor"],
+          "description": "Available branch types in the Task Manager."
+        },
+        "hareer.clickup.pollIntervalMs": {
+          "type": "number",
+          "default": 0,
+          "description": "Auto-refresh task list at this interval (ms). 0 disables polling."
+        }
+      }
     }
   },
   "devDependencies": {

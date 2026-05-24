@@ -9,6 +9,15 @@ import { HareerCommentProvider } from "./code-review/comment-provider";
 import { openDiff, cleanupTempFiles } from "./code-review/diff-provider";
 import { parseGitmodules } from "./code-review/submodule-parser";
 import { invalidateToken, mergePR } from "./code-review/github-api";
+import { syncConnectedContext } from "./task-manager/auth";
+import { TaskService } from "./task-manager/task-service";
+import { TaskTreeProvider } from "./task-manager/task-tree-provider";
+import {
+  connectClickUp,
+  disconnectClickUp,
+  switchClickUpWorkspace,
+} from "./task-manager/commands";
+import { TaskDetailPanel } from "./task-manager/task-detail-webview";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   let makefileRootUri: vscode.Uri | undefined;
@@ -109,9 +118,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   await loadSubmodules();
 
+  const taskService = new TaskService(context);
+  const taskTreeProvider = new TaskTreeProvider(taskService);
+  const taskTreeView = vscode.window.createTreeView("hareerTaskManager", {
+    treeDataProvider: taskTreeProvider,
+    showCollapseAll: true,
+  });
+
+  await syncConnectedContext(context);
+  void taskService.refresh();
+
   context.subscriptions.push(
     makefileTreeView,
     codeReviewTreeView,
+    taskTreeView,
+    taskService,
     commentProvider,
 
     vscode.commands.registerCommand("hareer.runTarget", async (targetName: unknown) => {
@@ -247,9 +268,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       },
     ),
 
+    vscode.commands.registerCommand("hareer.connectClickUp", async () => {
+      await connectClickUp(context, taskService);
+    }),
+
+    vscode.commands.registerCommand("hareer.disconnectClickUp", async () => {
+      await disconnectClickUp(context, taskService);
+    }),
+
+    vscode.commands.registerCommand("hareer.switchClickUpWorkspace", async () => {
+      await switchClickUpWorkspace(taskService);
+    }),
+
+    vscode.commands.registerCommand("hareer.refreshTasks", async () => {
+      await taskService.refresh();
+    }),
+
+    vscode.commands.registerCommand("hareer.openTaskDetail", async (taskId: unknown) => {
+      if (typeof taskId !== "string" || taskId.length === 0) return;
+      await TaskDetailPanel.openOrReveal(context, taskService, taskId);
+    }),
+
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       void reloadMakefile();
       void loadSubmodules();
+      void taskService.refresh();
     }),
 
     new vscode.Disposable(() => {
