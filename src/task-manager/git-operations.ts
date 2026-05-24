@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import * as path from "node:path";
 import * as vscode from "vscode";
 
 interface RemoteRef {
@@ -21,8 +22,13 @@ interface RepoState {
   readonly indexChanges: unknown[];
 }
 
+interface InputBox {
+  value: string;
+}
+
 interface Repository {
   readonly rootUri: vscode.Uri;
+  readonly inputBox: InputBox;
   readonly state: RepoState;
   fetch(remote?: string, ref?: string): Promise<void>;
   createBranch(name: string, checkout: boolean, ref?: string): Promise<void>;
@@ -55,7 +61,9 @@ export async function getGitApi(): Promise<GitAPI> {
   return api;
 }
 
-export async function pickRepository(): Promise<Repository | undefined> {
+export async function pickRepository(options?: {
+  placeHolder?: string;
+}): Promise<Repository | undefined> {
   const api = await getGitApi();
   if (api.repositories.length === 0) {
     void vscode.window.showWarningMessage("Hareer: No git repository found in the workspace.");
@@ -75,9 +83,58 @@ export async function pickRepository(): Promise<Repository | undefined> {
       description: r.state.HEAD?.name ?? "(detached)",
       repo: r,
     })),
-    { placeHolder: "Select repository for this task" },
+    { placeHolder: options?.placeHolder ?? "Select repository for this task" },
   );
   return picked?.repo;
+}
+
+/** Pick the repo whose changes the commit / generate flow should target. */
+export async function pickRepositoryForChanges(): Promise<Repository | undefined> {
+  const api = await getGitApi();
+  if (api.repositories.length === 0) {
+    void vscode.window.showWarningMessage("Hareer: No git repository found in the workspace.");
+    return undefined;
+  }
+  if (api.repositories.length === 1) return api.repositories[0];
+
+  const picked = await vscode.window.showQuickPick(
+    api.repositories.map((r) => ({
+      label: vscode.workspace.asRelativePath(r.rootUri.fsPath),
+      description: r.state.HEAD?.name ?? "(detached)",
+      repo: r,
+    })),
+    { placeHolder: "Select repo of main changes" },
+  );
+  return picked?.repo;
+}
+
+/** Resolve a vscode.git Repository by root path, opening it in SCM if needed. */
+export async function findRepositoryByRoot(rootPath: string): Promise<Repository | undefined> {
+  const api = await getGitApi();
+  const normalized = path.normalize(rootPath);
+
+  const match = (repos: Repository[]): Repository | undefined =>
+    repos.find((r) => path.normalize(r.rootUri.fsPath) === normalized);
+
+  let repo = match(api.repositories);
+  if (repo) return repo;
+
+  repo = api.getRepository(vscode.Uri.file(rootPath)) ?? undefined;
+  if (repo) return repo;
+
+  try {
+    await vscode.commands.executeCommand("git.openRepository", rootPath);
+  } catch {
+    /* repo may already be open under a different discovery path */
+  }
+
+  await sleep(300);
+  const refreshed = await getGitApi();
+  return match(refreshed.repositories) ?? refreshed.getRepository(vscode.Uri.file(rootPath)) ?? undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function execGit(cwd: string, args: string[]): Promise<string> {
@@ -238,6 +295,16 @@ export function getDirtyStatus(repo: Repository): DirtyStatus {
 
 export async function stageAll(repo: Repository): Promise<void> {
   await execGit(repo.rootUri.fsPath, ["add", "-A"]);
+}
+
+/** True when the index has staged diffs (uses git, not vscode.git cache). */
+export async function hasStagedChanges(repo: Repository): Promise<boolean> {
+  try {
+    await execGit(repo.rootUri.fsPath, ["diff", "--cached", "--quiet"]);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 export async function commit(

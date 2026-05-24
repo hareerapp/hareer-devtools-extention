@@ -9,11 +9,16 @@ import {
   getDirtyStatus,
   getOriginRemote,
   pickRepository,
+  pickRepositoryForChanges,
   push as gitPush,
 } from "./git-operations";
 import type { Repository } from "./git-operations";
 import { formatBranchName, validateGitRef } from "./branch-naming";
 import { formatCommitMessage } from "./commit-naming";
+import {
+  generateCommitMessageViaCursor,
+  isCursorIDE,
+} from "./cursor-commit-generator";
 import { findPRField, getLinkedPR } from "./pr-url-field";
 import { getTask, setCustomFieldValue, updateTaskStatus } from "./clickup-api";
 import { getClickUpToken } from "./auth";
@@ -36,6 +41,7 @@ type InboundMessage =
   | { type: "checkoutTaskBranches" }
   | { type: "openTaskReview" }
   | { type: "commit"; commitType: CommitType; scope: string; subject: string; body: string; stageAll: boolean; thenPush: boolean }
+  | { type: "generateCommit"; stageAll: boolean }
   | { type: "push" }
   | { type: "linkPR"; url: string };
 
@@ -240,6 +246,9 @@ export class TaskDetailPanel {
         return;
       case "commit":
         await this.handleCommit(msg);
+        return;
+      case "generateCommit":
+        await this.handleGenerateCommit(msg.stageAll);
         return;
       case "push":
         await this.handlePush();
@@ -468,6 +477,38 @@ export class TaskDetailPanel {
     );
   }
 
+  private async handleGenerateCommit(stageAll: boolean): Promise<void> {
+    if (!this.state) return;
+    const repo = await pickRepositoryForChanges();
+    if (!repo) return;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Generating commit message with Cursor…",
+        cancellable: false,
+      },
+      async () => {
+        try {
+          const draft = await generateCommitMessageViaCursor(repo, stageAll);
+          const formType = formCommitTypeForWebview(draft.type);
+          void this.panel.webview.postMessage({
+            type: "commitDraft",
+            commitType: formType,
+            scope: draft.scope ?? "",
+            subject: draft.subject,
+            body: draft.body ?? "",
+          });
+          this.postState();
+          this.postFlash("Commit message generated.");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          void vscode.window.showErrorMessage(`Hareer: ${msg}`);
+        }
+      },
+    );
+  }
+
   private async handleCommit(
     msg: Extract<InboundMessage, { type: "commit" }>,
   ): Promise<void> {
@@ -476,7 +517,7 @@ export class TaskDetailPanel {
       void vscode.window.showWarningMessage("Hareer: Commit subject is required.");
       return;
     }
-    const repo = await pickRepository();
+    const repo = await pickRepositoryForChanges();
     if (!repo) return;
 
     const message = formatCommitMessage({
@@ -683,6 +724,7 @@ export class TaskDetailPanel {
         title: p.title,
         url: p.url,
       })),
+      cursorCommitGenerate: isCursorIDE(),
     });
   }
 
@@ -743,6 +785,21 @@ function commitTypeMap(): Record<string, string> {
     style: "style",
     perf: "perf",
   };
+}
+
+const WEBVIEW_COMMIT_TYPES = new Set([
+  "feat",
+  "fix",
+  "chore",
+  "docs",
+  "refactor",
+  "test",
+  "style",
+  "perf",
+]);
+
+function formCommitTypeForWebview(type: CommitType): CommitType {
+  return WEBVIEW_COMMIT_TYPES.has(type) ? type : "chore";
 }
 
 function sanitizeColor(raw: string | undefined): string {
@@ -977,6 +1034,9 @@ h2:first-child { margin-top: 0; }
 .commit-grid { display: grid; grid-template-columns: 80px 1fr; gap: 8px 12px; align-items: center; }
 .commit-grid label { font-size: 0.78rem; color: var(--hareer-muted); }
 .commit-grid .chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.subject-row { display: flex; gap: 8px; align-items: center; }
+.subject-row input { flex: 1; min-width: 0; }
+.subject-row button { flex-shrink: 0; white-space: nowrap; }
 input[type=text], textarea { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, transparent); padding: 5px 8px; font-family: inherit; font-size: 0.85rem; border-radius: 3px; width: 100%; box-sizing: border-box; }
 input[type=text]:focus, textarea:focus { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
 textarea { resize: vertical; min-height: 60px; }
@@ -1328,12 +1388,19 @@ function render() {
             '<label>Scope</label>' +
             '<input type="text" id="scope-input" value="' + escape(savedState.commitScope || "") + '" placeholder="optional (e.g. auth)" style="max-width:240px" />' +
             '<label>Subject</label>' +
-            '<input type="text" id="subject-input" value="' + escape(savedState.commitSubject || "") + '" placeholder="short imperative summary" />' +
+            '<div class="subject-row">' +
+              '<input type="text" id="subject-input" value="' + escape(savedState.commitSubject || "") + '" placeholder="short imperative summary" />' +
+              (model.cursorCommitGenerate
+                ? '<button class="secondary" id="generate-commit-btn" title="Generate from staged changes using Cursor AI">✨ Generate</button>'
+                : '') +
+            '</div>' +
             '<label>Body</label>' +
             '<textarea id="body-input" placeholder="optional details">' + escape(savedState.commitBody || "") + '</textarea>' +
           '</div>' +
           '<div class="preview" id="commit-preview"></div>' +
-          '<div class="commit-hint">Tip: <kbd>⌘ Enter</kbd> (or <kbd>Ctrl Enter</kbd>) commits.</div>' +
+          '<div class="commit-hint">Tip: <kbd>⌘ Enter</kbd> (or <kbd>Ctrl Enter</kbd>) commits.' +
+            (model.cursorCommitGenerate ? ' ✨ Generate uses Cursor AI on staged changes (respects “Stage all”).' : '') +
+          '</div>' +
           '<div class="action-row">' +
             '<label class="checkbox-row"><input type="checkbox" id="stage-all"' + (savedState.stageAll ? " checked" : "") + ' />Stage all changes</label>' +
             '<span class="spacer"></span>' +
@@ -1542,6 +1609,10 @@ function bindEvents() {
   if (commitPush) commitPush.addEventListener("click", () => sendCommit(true));
   const push = document.getElementById("push-btn");
   if (push) push.addEventListener("click", () => vscode.postMessage({ type: "push" }));
+  const generateCommit = document.getElementById("generate-commit-btn");
+  if (generateCommit) generateCommit.addEventListener("click", () => {
+    vscode.postMessage({ type: "generateCommit", stageAll: !!savedState.stageAll });
+  });
 
   const relink = document.getElementById("relink-btn");
   if (relink) relink.addEventListener("click", () => {
@@ -1582,6 +1653,14 @@ window.addEventListener("message", (e) => {
   const msg = e.data;
   if (msg.type === "state") {
     model = msg;
+    render();
+  } else if (msg.type === "commitDraft") {
+    savedState.commitType = msg.commitType || savedState.commitType;
+    savedState.commitScope = msg.scope || "";
+    savedState.commitSubject = msg.subject || "";
+    savedState.commitBody = msg.body || "";
+    savedState.showCommitSection = true;
+    saveDraft();
     render();
   } else if (msg.type === "flash") {
     flash(msg.text);
