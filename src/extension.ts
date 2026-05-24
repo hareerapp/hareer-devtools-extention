@@ -113,7 +113,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         const pr = await fetchPRByNumber(submodule.owner, submodule.repo, prNumber);
         const verb = event === "APPROVE" ? "Approving" : event === "REQUEST_CHANGES" ? "Requesting changes" : "Commenting";
         const summary = await vscode.window.showInputBox({
-          prompt: `${verb} on PR #${prNumber} — summary (optional)`,
+          prompt:
+            event === "REQUEST_CHANGES" || event === "COMMENT"
+              ? `${verb} on PR #${prNumber} — summary required unless you added inline comments`
+              : `${verb} on PR #${prNumber} — summary (optional)`,
           placeHolder: "Leave a summary for this review…",
         });
         if (summary === undefined) return;

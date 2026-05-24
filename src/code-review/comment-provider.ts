@@ -1,8 +1,16 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  commentableRightLinesForFile,
+  fileByPath,
+  isLineInFileDiff,
+  rangesFromCommentLines,
+} from "./diff-lines";
+import {
   createReviewComment,
+  fetchPRByNumber,
   fetchPRComments,
+  fetchPRFiles,
   replyToReviewComment,
   submitReview,
 } from "./github-api";
@@ -16,6 +24,8 @@ interface ActiveDiffContext {
   file: PRFile;
   headSha: string;
   headFileUri: vscode.Uri;
+  /** 1-based head-side line numbers that GitHub accepts for this file in the PR diff. */
+  commentableRightLines: ReadonlySet<number>;
   /** Threads we created from server comments — keyed by root comment id. */
   threadsByRootId: Map<number, vscode.CommentThread>;
   /** All threads we created in this file (server + local). */
@@ -47,10 +57,10 @@ export class HareerCommentProvider implements vscode.Disposable {
 
     this.controller.commentingRangeProvider = {
       provideCommentingRanges: (document, _token) => {
-        if (this.activeDiffs.has(path.normalize(document.uri.fsPath))) {
-          return [new vscode.Range(0, 0, document.lineCount - 1, 0)];
-        }
-        return undefined;
+        const ctx = this.activeDiffs.get(path.normalize(document.uri.fsPath));
+        if (!ctx) return undefined;
+        const ranges = rangesFromCommentLines(ctx.commentableRightLines);
+        return ranges.length > 0 ? ranges : undefined;
       },
     };
 
@@ -72,16 +82,45 @@ export class HareerCommentProvider implements vscode.Disposable {
       for (const t of existing.threads) t.dispose();
     }
 
+    let prFilePatch: string | undefined;
+    try {
+      const prFiles = await fetchPRFiles(submodule.owner, submodule.repo, pr.number);
+      prFilePatch = prFiles.find((f) => f.filename === file.filename)?.patch;
+    } catch {
+      /* comment ranges stay empty */
+    }
+
+    let headLineCount = 0;
+    try {
+      const doc = await vscode.workspace.openTextDocument(headFileUri);
+      headLineCount = doc.lineCount;
+    } catch {
+      /* ignore */
+    }
+
+    const commentableRightLines = commentableRightLinesForFile(
+      prFilePatch,
+      file.status,
+      headLineCount,
+    );
+
     const ctx: ActiveDiffContext = {
       submodule,
       pr,
       file,
       headSha,
       headFileUri,
+      commentableRightLines,
       threadsByRootId: new Map(),
       threads: [],
     };
     this.activeDiffs.set(key, ctx);
+
+    if (commentableRightLines.size === 0 && file.status !== "removed") {
+      void vscode.window.showWarningMessage(
+        `Hareer: Could not load diff hunks for ${file.filename}. Inline comments may fail — try re-opening the file or comment from github.com.`,
+      );
+    }
 
     let comments: ReviewComment[];
     try {
@@ -149,6 +188,13 @@ export class HareerCommentProvider implements vscode.Disposable {
     const meta = this.threadMeta.get(thread) ?? { hasPending: false };
     const isReply = meta.serverRootId !== undefined;
 
+    if (!isReply && !ctx.commentableRightLines.has(lineNumber)) {
+      void vscode.window.showErrorMessage(
+        `Hareer: Line ${lineNumber} is not part of the PR diff. Comment on a changed line (green) or a nearby context line in the diff gutter.`,
+      );
+      return;
+    }
+
     const placeholder: vscode.Comment = {
       author: { name: "You (pending)" },
       body: new vscode.MarkdownString(`${text.trim()}\n\n*— pending review*`),
@@ -213,8 +259,79 @@ export class HareerCommentProvider implements vscode.Disposable {
     const pending = this.store.get(submodule.owner, submodule.repo, pr.number);
     const replies = pending?.comments.filter((c) => c.inReplyToId !== undefined) ?? [];
     const newComments = pending?.comments.filter((c) => c.inReplyToId === undefined) ?? [];
+    const hasInlineComments = replies.length + newComments.length > 0;
+
+    const body = resolveReviewBody(event, summary, hasInlineComments);
+    if (body === null) {
+      void vscode.window.showErrorMessage(
+        event === "REQUEST_CHANGES"
+          ? "Hareer: Request changes requires a review summary or at least one inline comment."
+          : "Hareer: A comment review requires a summary or at least one inline comment.",
+      );
+      return;
+    }
 
     try {
+      const freshPr = await fetchPRByNumber(submodule.owner, submodule.repo, pr.number);
+      const prFiles = await fetchPRFiles(submodule.owner, submodule.repo, pr.number);
+
+      if (freshPr.headSha !== pr.headSha) {
+        void vscode.window.showWarningMessage(
+          "Hareer: This PR has new commits since you opened the diff. Re-open file diffs so comment lines stay in sync.",
+        );
+      }
+
+      const validNewComments = newComments.filter((c) =>
+        isLineInFileDiff(fileByPath(prFiles, c.path), c.line),
+      );
+      const skippedPathComments = newComments.filter(
+        (c) => !fileByPath(prFiles, c.path),
+      ).length;
+      const skippedLineComments = newComments.filter(
+        (c) => fileByPath(prFiles, c.path) && !isLineInFileDiff(fileByPath(prFiles, c.path), c.line),
+      );
+
+      if (skippedPathComments > 0) {
+        void vscode.window.showWarningMessage(
+          `Hareer: Skipped ${skippedPathComments} comment(s) on files that are not part of this PR.`,
+        );
+      }
+
+      if (skippedLineComments.length > 0) {
+        const examples = skippedLineComments
+          .slice(0, 3)
+          .map((c) => `${c.path}:${c.line}`)
+          .join(", ");
+        void vscode.window.showWarningMessage(
+          `Hareer: Skipped ${skippedLineComments.length} comment(s) not on a diff line (${examples}). Re-open the file diff and comment on changed or context lines.`,
+        );
+      }
+
+      if (
+        validNewComments.length === 0 &&
+        replies.length === 0 &&
+        body.length === 0 &&
+        event !== "APPROVE"
+      ) {
+        void vscode.window.showErrorMessage(
+          "Hareer: Add a review summary or at least one inline comment on a changed line.",
+        );
+        return;
+      }
+
+      if (validNewComments.length === 0 && newComments.length > 0 && replies.length === 0) {
+        if (body.length === 0 && event !== "APPROVE") {
+          void vscode.window.showErrorMessage(
+            "Hareer: All pending inline comments are on lines GitHub cannot resolve. Re-open the file diff, comment on green or context lines in the change, then submit again.",
+          );
+          return;
+        }
+        this.discardInvalidPendingComments(submodule, pr.number, validNewComments, newComments);
+        void vscode.window.showWarningMessage(
+          "Hareer: Pending inline comments could not be placed on the diff; submitting your review summary only.",
+        );
+      }
+
       await Promise.all(
         replies.map((r) =>
           replyToReviewComment(
@@ -231,9 +348,10 @@ export class HareerCommentProvider implements vscode.Disposable {
         owner: submodule.owner,
         repo: submodule.repo,
         pullNumber: pr.number,
+        commitId: freshPr.headSha,
         event,
-        body: summary,
-        comments: newComments.map((c) => ({
+        body,
+        comments: validNewComments.map((c) => ({
           path: c.path,
           line: c.line,
           side: "RIGHT",
@@ -308,7 +426,12 @@ export class HareerCommentProvider implements vscode.Disposable {
     if (!picked) return;
 
     const summary = await vscode.window.showInputBox({
-      prompt: "Review summary (optional — leave empty for no summary)",
+      prompt:
+        pendingCount > 0
+          ? "Review summary (optional for approve — required for request changes / comment-only if you have no inline comments)"
+          : eventRequiresBodyPlaceholder(picked)
+            ? "Review summary (required for request changes and comment-only reviews)"
+            : "Review summary (optional — leave empty for a plain approval)",
       placeHolder: "Overall feedback on this PR…",
     });
     if (summary === undefined) return;
@@ -380,6 +503,30 @@ export class HareerCommentProvider implements vscode.Disposable {
     return this.store.countFor(submodule.owner, submodule.repo, pr.number);
   }
 
+  /** Drop pending root comments that are not on diff lines before a summary-only submit. */
+  private discardInvalidPendingComments(
+    submodule: Submodule,
+    prNumber: number,
+    validNewComments: PendingComment[],
+    allNewComments: PendingComment[],
+  ): void {
+    const validSet = new Set(validNewComments);
+    for (const comment of allNewComments) {
+      if (validSet.has(comment)) continue;
+      const removed = this.store.removeByThread(
+        submodule.owner,
+        submodule.repo,
+        prNumber,
+        comment.thread,
+      );
+      if (!removed) continue;
+      comment.thread.comments = comment.thread.comments.filter((c) => c !== removed.placeholder);
+      if (comment.thread.comments.length === 0) {
+        comment.thread.dispose();
+      }
+    }
+  }
+
   /**
    * Re-fetch comments for the PR and rebuild any currently-open file threads from
    * the new server state. Called after a successful submit.
@@ -417,6 +564,30 @@ function eventVerb(event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"): string {
     case "COMMENT":
       return "Commented";
   }
+}
+
+function eventRequiresBodyPlaceholder(picked: vscode.QuickPickItem): boolean {
+  return picked.label.includes("Request") || picked.label.includes("Comment");
+}
+
+/**
+ * GitHub requires a non-empty review body for REQUEST_CHANGES and COMMENT.
+ * Approve may be submitted with no body when there are no inline comments.
+ */
+function resolveReviewBody(
+  event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  summary: string,
+  hasInlineComments: boolean,
+): string | null {
+  const trimmed = summary.trim();
+  if (trimmed) return trimmed;
+
+  if (event === "REQUEST_CHANGES" || event === "COMMENT") {
+    if (hasInlineComments) return "See inline comments.";
+    return null;
+  }
+
+  return "";
 }
 
 function buildVscodeComment(c: ReviewComment): vscode.Comment {

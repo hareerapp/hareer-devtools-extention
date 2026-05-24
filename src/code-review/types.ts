@@ -32,6 +32,7 @@ export interface PRFile {
   readonly additions: number;
   readonly deletions: number;
   readonly previousFilename?: string;
+  readonly patch?: string;
 }
 
 export interface ReviewComment {
@@ -60,6 +61,7 @@ export interface SubmitReviewPayload {
   readonly owner: string;
   readonly repo: string;
   readonly pullNumber: number;
+  readonly commitId: string;
   readonly event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
   readonly body: string;
   readonly comments: readonly ReviewLineComment[];

@@ -47,6 +47,55 @@ export async function reconnectGitHub(): Promise<void> {
   cachedToken = session.accessToken;
 }
 
+interface GitHubErrorItem {
+  resource?: string;
+  field?: string;
+  code?: string;
+  message?: string;
+}
+
+interface GitHubErrorResponse {
+  message?: string;
+  errors?: unknown[];
+}
+
+function formatGitHubErrorItem(error: unknown): string | undefined {
+  if (typeof error === "string") return error;
+  if (!error || typeof error !== "object") return undefined;
+  const item = error as GitHubErrorItem;
+  if (item.message) return item.message;
+  if (item.field && item.code) return `${item.field}: ${item.code}`;
+  return item.code ?? item.field;
+}
+
+function formatGitHubError(
+  statusCode: number,
+  path: string,
+  parsed: GitHubErrorResponse,
+  raw: string,
+): string {
+  const baseMsg = parsed.message ?? `HTTP ${statusCode}`;
+  const details = parsed.errors
+    ?.map(formatGitHubErrorItem)
+    .filter((msg): msg is string => Boolean(msg));
+  let detailSuffix = details && details.length > 0 ? ` — ${details.join("; ")}` : "";
+  if (!detailSuffix && baseMsg === "Unprocessable Entity" && raw.length > 0) {
+    detailSuffix = ` — ${raw.slice(0, 400)}`;
+  }
+  const hint =
+    statusCode === 404
+      ? ` — verify the repo exists and your GitHub token has access to https://github.com${path.split("?")[0].replace("/repos", "")}`
+      : statusCode === 401
+        ? " — your GitHub token is invalid or lacks the 'repo' scope"
+        : statusCode === 422 && detailSuffix.includes("pending review")
+          ? " — finish or discard your in-progress review on GitHub first"
+          : statusCode === 422 &&
+            `${baseMsg} ${detailSuffix}`.toLowerCase().includes("could not be resolved")
+          ? " — comment only on lines shown in the PR diff (changed or nearby context). Re-open the file diff if the PR was updated"
+            : "";
+  return `GitHub API error (${statusCode}): ${baseMsg}${detailSuffix}${hint}`;
+}
+
 function githubRequest<T>(
   method: string,
   path: string,
@@ -80,14 +129,11 @@ function githubRequest<T>(
         try {
           const parsed = JSON.parse(raw) as T;
           if (res.statusCode !== undefined && res.statusCode >= 400) {
-            const baseMsg = (parsed as { message?: string }).message ?? `HTTP ${res.statusCode}`;
-            const hint =
-              res.statusCode === 404
-                ? ` — verify the repo exists and your GitHub token has access to https://github.com${path.split("?")[0].replace("/repos", "")}`
-                : res.statusCode === 401
-                  ? " — your GitHub token is invalid or lacks the 'repo' scope"
-                  : "";
-            reject(new Error(`GitHub API error (${res.statusCode}): ${baseMsg}${hint}`));
+            reject(
+              new Error(
+                formatGitHubError(res.statusCode, path, parsed as GitHubErrorResponse, raw),
+              ),
+            );
           } else {
             resolve(parsed);
           }
@@ -118,6 +164,7 @@ interface RawFile {
   additions: number;
   deletions: number;
   previous_filename?: string;
+  patch?: string;
 }
 
 interface RawComment {
@@ -195,6 +242,7 @@ export async function fetchPRFiles(
     additions: f.additions,
     deletions: f.deletions,
     previousFilename: f.previous_filename,
+    patch: f.patch,
   }));
 }
 
@@ -297,23 +345,143 @@ export async function createReviewComment(
   );
 }
 
-export async function submitReview(payload: SubmitReviewPayload): Promise<void> {
+export async function fetchAuthenticatedUser(): Promise<GitHubUser> {
   const token = await getToken();
+  const raw = await githubRequest<RawGitHubUser>("GET", "/user", token);
+  return mapUser(raw);
+}
+
+export async function deletePendingReview(
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  reviewId: number,
+): Promise<void> {
+  const token = await getToken();
+  await githubRequest<unknown>(
+    "DELETE",
+    `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews/${reviewId}`,
+    token,
+  );
+}
+
+async function findMyPendingReview(
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  login: string,
+): Promise<PRReview | undefined> {
+  const reviews = await fetchPRReviews(owner, repo, pullNumber);
+  return reviews.find((r) => r.state === "PENDING" && r.user.login === login);
+}
+
+async function deleteMyPendingReviews(
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  login: string,
+): Promise<void> {
+  const reviews = await fetchPRReviews(owner, repo, pullNumber);
+  const pending = reviews.filter((r) => r.state === "PENDING" && r.user.login === login);
+  await Promise.all(
+    pending.map((r) => deletePendingReview(owner, repo, pullNumber, r.id)),
+  );
+}
+
+async function submitPendingReviewEvent(
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  reviewId: number,
+  event: SubmitReviewPayload["event"],
+  body: string | undefined,
+): Promise<void> {
+  const token = await getToken();
+  const requestBody: Record<string, unknown> = { event };
+  if (body !== undefined && body.length > 0) {
+    requestBody.body = body;
+  }
+  await githubRequest<unknown>(
+    "POST",
+    `/repos/${owner}/${repo}/pulls/${pullNumber}/reviews/${reviewId}/events`,
+    token,
+    requestBody,
+  );
+}
+
+async function createAndSubmitReview(payload: SubmitReviewPayload): Promise<void> {
+  const token = await getToken();
+  const requestBody: Record<string, unknown> = {
+    commit_id: payload.commitId,
+    event: payload.event,
+  };
+  if (payload.body.length > 0) {
+    requestBody.body = payload.body;
+  }
   await githubRequest<unknown>(
     "POST",
     `/repos/${payload.owner}/${payload.repo}/pulls/${payload.pullNumber}/reviews`,
     token,
-    {
-      body: payload.body,
-      event: payload.event,
-      comments: payload.comments.map((c) => ({
-        path: c.path,
-        line: c.line,
-        side: c.side,
-        body: c.body,
-      })),
-    },
+    requestBody,
   );
+}
+
+/**
+ * Post inline comments individually, then submit the pending review — avoids
+ * batch payload validation failures from POST /pulls/{n}/reviews.
+ */
+export async function submitReview(payload: SubmitReviewPayload): Promise<void> {
+  const me = await fetchAuthenticatedUser();
+  await deleteMyPendingReviews(payload.owner, payload.repo, payload.pullNumber, me.login);
+
+  for (const comment of payload.comments) {
+    try {
+      await createReviewComment(
+        payload.owner,
+        payload.repo,
+        payload.pullNumber,
+        payload.commitId,
+        comment.path,
+        comment.line,
+        comment.body,
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`${comment.path}:${comment.line} — ${detail}`);
+    }
+  }
+
+  const pending = await findMyPendingReview(
+    payload.owner,
+    payload.repo,
+    payload.pullNumber,
+    me.login,
+  );
+
+  const reviewBody = payload.body.length > 0 ? payload.body : undefined;
+
+  if (pending) {
+    const eventBody =
+      reviewBody ??
+      (payload.event === "APPROVE" ? undefined : "See inline comments.");
+    await submitPendingReviewEvent(
+      payload.owner,
+      payload.repo,
+      payload.pullNumber,
+      pending.id,
+      payload.event,
+      eventBody,
+    );
+    return;
+  }
+
+  if (payload.event !== "APPROVE" && !reviewBody) {
+    throw new Error(
+      "Review summary is required when requesting changes or commenting without inline comments.",
+    );
+  }
+
+  await createAndSubmitReview(payload);
 }
 
 interface RawGitHubUser {
