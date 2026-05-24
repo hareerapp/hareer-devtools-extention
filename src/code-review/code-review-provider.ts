@@ -195,6 +195,59 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     await checkoutPRBranch(submodule, selectedPR.headRef);
   }
 
+  /**
+   * Select a specific PR without the QuickPick. Used when the caller already
+   * knows the PR number (e.g. driven from the Task Manager "Code Review" button).
+   * Pass `openDetail=false` to display the PR only inside the Code Review tree
+   * without opening the standalone PR detail webview panel.
+   */
+  async selectPRByNumber(
+    submodule: Submodule,
+    prNumber: number,
+    openDetail: boolean,
+  ): Promise<void> {
+    const st = this.ensureState(submodule);
+    st.loading = true;
+    this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
+
+    const { fetchPRByNumber } = await import("./github-api");
+    let pr: PullRequest;
+    try {
+      pr = await fetchPRByNumber(submodule.owner, submodule.repo, prNumber);
+    } catch (err) {
+      st.loading = false;
+      this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
+      const msg = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Hareer: PR #${prNumber} not found — ${msg}`);
+      return;
+    }
+
+    let files: PRFile[];
+    try {
+      files = await fetchPRFiles(submodule.owner, submodule.repo, prNumber);
+    } catch (err) {
+      st.loading = false;
+      this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
+      const msg = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Hareer: Failed to fetch PR files — ${msg}`);
+      return;
+    }
+
+    st.selectedPR = pr;
+    st.files = files;
+    st.folderTree = buildFolderTree(files);
+    st.loading = false;
+    this._onDidChangeTreeData.fire(undefined);
+
+    // Reveal the PR row in the tree.
+    void this._onDidChangeTreeData.fire(undefined);
+
+    if (openDetail) {
+      this.onPRSelected(submodule, pr);
+    }
+    await checkoutPRBranch(submodule, pr.headRef);
+  }
+
   private ensureState(submodule: Submodule): SubmoduleState {
     let st = this.state.get(submodule.name);
     if (!st) {

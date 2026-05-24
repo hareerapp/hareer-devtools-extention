@@ -89,6 +89,90 @@ function execGit(cwd: string, args: string[]): Promise<string> {
   });
 }
 
+/**
+ * Find a local or remote branch in the given repo whose name contains the
+ * substring (typically a ClickUp task id). Returns the local-style branch
+ * name (no `origin/` prefix) so the caller can hand it to `git checkout`.
+ */
+export async function findTaskBranch(cwd: string, taskId: string): Promise<string | undefined> {
+  try {
+    const out = await execGit(cwd, [
+      "for-each-ref",
+      "--format=%(refname:short)",
+      "refs/heads",
+      "refs/remotes",
+    ]);
+    const needle = taskId.toLowerCase();
+    const all = out.split("\n").filter(Boolean);
+    const local = all.find((b) => !b.includes("/") && b.toLowerCase().includes(needle));
+    if (local) return local;
+    const origin = all.find(
+      (b) => b.startsWith("origin/") && !b.includes("HEAD") && b.toLowerCase().includes(needle),
+    );
+    if (origin) return origin.slice("origin/".length);
+    const other = all.find(
+      (b) => b.includes("/") && !b.includes("HEAD") && b.toLowerCase().includes(needle),
+    );
+    return other ? other.split("/").slice(1).join("/") : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Direct shell-out checkout (used when we need to operate on submodule paths
+ * that the vscode.git extension may not track as separate repositories).
+ * Tries plain checkout first; falls back to creating a tracking branch from
+ * origin if the branch only exists remotely.
+ */
+export async function checkoutBranchInDir(cwd: string, branch: string): Promise<void> {
+  try {
+    await execGit(cwd, ["fetch", "origin"]);
+  } catch {
+    /* tolerate fetch failure (offline, no remote) */
+  }
+  try {
+    await execGit(cwd, ["checkout", branch]);
+  } catch {
+    await execGit(cwd, ["checkout", "-b", branch, `origin/${branch}`]);
+  }
+}
+
+/**
+ * Create a branch (off origin/<default>) and check it out, via shell.
+ * Used for multi-repo branch creation where vscode.git Repository objects
+ * aren't available for each submodule.
+ */
+export async function createAndCheckoutBranchInDir(
+  cwd: string,
+  branchName: string,
+): Promise<void> {
+  try {
+    await execGit(cwd, ["fetch", "origin"]);
+  } catch {
+    /* offline or no remote */
+  }
+
+  let base = "main";
+  try {
+    const head = await execGit(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]);
+    base = head.split("/").pop() || base;
+  } catch {
+    /* fall back to "main" */
+  }
+
+  try {
+    await execGit(cwd, ["checkout", "-b", branchName, `origin/${base}`]);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.toLowerCase().includes("already exists")) {
+      await execGit(cwd, ["checkout", branchName]);
+      return;
+    }
+    throw err;
+  }
+}
+
 export async function getDefaultBranch(repo: Repository): Promise<string> {
   const remote = repo.state.remotes.find((r) => r.name === "origin") ?? repo.state.remotes[0];
   if (!remote) return "main";

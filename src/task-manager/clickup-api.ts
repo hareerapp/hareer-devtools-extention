@@ -3,6 +3,7 @@ import type {
   ClickUpCustomField,
   ClickUpList,
   ClickUpStatus,
+  ClickUpTag,
   ClickUpTask,
   ClickUpTeam,
   ClickUpUser,
@@ -71,6 +72,12 @@ interface RawFolderRef {
   hidden?: boolean;
 }
 
+interface RawTag {
+  name: string;
+  tag_fg?: string;
+  tag_bg?: string;
+}
+
 interface RawTask {
   id: string;
   custom_id?: string | null;
@@ -80,8 +87,16 @@ interface RawTask {
   status: RawStatus;
   url: string;
   assignees: RawUser[];
+  watchers?: RawUser[];
+  creator?: RawUser;
   due_date?: string | null;
+  start_date?: string | null;
+  date_created?: string | null;
+  date_updated?: string | null;
   priority?: { id: string; priority: string; color: string } | null;
+  tags?: RawTag[];
+  time_estimate?: number | null;
+  time_spent?: number | null;
   custom_fields: RawCustomField[];
   list: RawListRef;
   space: RawSpaceRef;
@@ -181,6 +196,10 @@ function mapList(raw: RawListRef): ClickUpList {
   return { id: raw.id, name: raw.name };
 }
 
+function mapTag(t: RawTag): ClickUpTag {
+  return { name: t.name, fg: t.tag_fg, bg: t.tag_bg };
+}
+
 function mapTask(raw: RawTask): ClickUpTask {
   return {
     id: raw.id,
@@ -190,8 +209,16 @@ function mapTask(raw: RawTask): ClickUpTask {
     status: mapStatus(raw.status),
     url: raw.url,
     assignees: raw.assignees.map(mapUser),
+    watchers: (raw.watchers ?? []).map(mapUser),
+    creator: raw.creator ? mapUser(raw.creator) : undefined,
     dueDate: raw.due_date ?? undefined,
+    startDate: raw.start_date ?? undefined,
+    createdAt: raw.date_created ?? undefined,
+    updatedAt: raw.date_updated ?? undefined,
     priority: raw.priority ?? undefined,
+    tags: (raw.tags ?? []).map(mapTag),
+    timeEstimateMs: raw.time_estimate ?? undefined,
+    timeSpentMs: raw.time_spent ?? undefined,
     customFields: raw.custom_fields.map(mapCustomField),
     list: mapList(raw.list),
     space: { id: raw.space.id, name: raw.space.name ?? "" },

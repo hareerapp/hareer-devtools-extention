@@ -44,6 +44,12 @@ export interface ClickUpFolder {
   readonly hidden?: boolean;
 }
 
+export interface ClickUpTag {
+  readonly name: string;
+  readonly fg?: string;
+  readonly bg?: string;
+}
+
 export interface ClickUpTask {
   readonly id: string;
   readonly customId?: string;
@@ -52,8 +58,16 @@ export interface ClickUpTask {
   readonly status: ClickUpStatus;
   readonly url: string;
   readonly assignees: readonly ClickUpUser[];
+  readonly watchers: readonly ClickUpUser[];
+  readonly creator?: ClickUpUser;
   readonly dueDate?: string;
+  readonly startDate?: string;
+  readonly createdAt?: string;
+  readonly updatedAt?: string;
   readonly priority?: { id: string; priority: string; color: string };
+  readonly tags: readonly ClickUpTag[];
+  readonly timeEstimateMs?: number;
+  readonly timeSpentMs?: number;
   readonly customFields: readonly ClickUpCustomField[];
   readonly list: ClickUpList;
   readonly space: ClickUpSpace;

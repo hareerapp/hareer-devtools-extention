@@ -243,6 +243,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
 
     vscode.commands.registerCommand(
+      "hareer.showPRInCodeReview",
+      async (submodule: Submodule | undefined, prNumber: number | undefined) => {
+        if (!submodule || typeof prNumber !== "number") return;
+        // Make sure code review knows about this submodule before selecting.
+        await loadSubmodules();
+        try {
+          await vscode.commands.executeCommand("hareerCodeReview.focus");
+        } catch {
+          /* view may not be visible yet — selection still works */
+        }
+        await codeReviewProvider.selectPRByNumber(submodule, prNumber, false);
+      },
+    ),
+
+    vscode.commands.registerCommand(
       "hareer.submitReview",
       async (node: CodeReviewNode | undefined) => {
         if (!node || node.kind !== "prSelector") {
