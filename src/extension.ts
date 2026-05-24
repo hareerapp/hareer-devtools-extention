@@ -8,7 +8,9 @@ import type { CodeReviewNode } from "./code-review/code-review-provider";
 import { HareerCommentProvider } from "./code-review/comment-provider";
 import { openDiff, cleanupTempFiles } from "./code-review/diff-provider";
 import { parseGitmodules } from "./code-review/submodule-parser";
-import { invalidateToken, mergePR, reconnectGitHub } from "./code-review/github-api";
+import { fetchPRByNumber, fetchPRFiles, invalidateToken, mergePR, reconnectGitHub } from "./code-review/github-api";
+import { PRDetailPanel } from "./code-review/pr-detail-webview";
+import type { Submodule } from "./code-review/types";
 import { syncConnectedContext } from "./task-manager/auth";
 import { TaskService } from "./task-manager/task-service";
 import { TaskTreeProvider } from "./task-manager/task-tree-provider";
@@ -82,6 +84,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   codeReviewProvider.setPendingCountResolver((submodule, pr) =>
     commentProvider.pendingCountFor(submodule, pr),
   );
+  codeReviewProvider.setOnPRSelected((submodule, pr) => {
+    void PRDetailPanel.openOrReveal(submodule, pr.number);
+  });
+
+  PRDetailPanel.configure({
+    async openFile(submodule, prNumber, filename) {
+      try {
+        const [pr, files] = await Promise.all([
+          fetchPRByNumber(submodule.owner, submodule.repo, prNumber),
+          fetchPRFiles(submodule.owner, submodule.repo, prNumber),
+        ]);
+        const file = files.find((f) => f.filename === filename);
+        if (!file) {
+          void vscode.window.showWarningMessage(`Hareer: File ${filename} not found in PR.`);
+          return;
+        }
+        await openDiff({ kind: "file", submodule, pr, file }, async (sm, p, f, headSha, headUri) => {
+          await commentProvider.loadCommentsForFile(sm, p, f, headSha, headUri);
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        void vscode.window.showErrorMessage(`Hareer: Could not open file diff — ${msg}`);
+      }
+    },
+    async promptSubmitReview(submodule, prNumber, event) {
+      try {
+        const pr = await fetchPRByNumber(submodule.owner, submodule.repo, prNumber);
+        const verb = event === "APPROVE" ? "Approving" : event === "REQUEST_CHANGES" ? "Requesting changes" : "Commenting";
+        const summary = await vscode.window.showInputBox({
+          prompt: `${verb} on PR #${prNumber} — summary (optional)`,
+          placeHolder: "Leave a summary for this review…",
+        });
+        if (summary === undefined) return;
+        await commentProvider.submitPendingReview(submodule, pr, event, summary);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        void vscode.window.showErrorMessage(`Hareer: Failed to submit review — ${msg}`);
+      }
+    },
+  });
 
   async function loadSubmodules(): Promise<void> {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
@@ -189,6 +231,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await openDiff(node, async (submodule, pr, file, headSha, headUri) => {
           await commentProvider.loadCommentsForFile(submodule, pr, file, headSha, headUri);
         });
+      },
+    ),
+
+    vscode.commands.registerCommand(
+      "hareer.openPRDetail",
+      async (submodule: Submodule | undefined, prNumber: number | undefined) => {
+        if (!submodule || typeof prNumber !== "number") return;
+        await PRDetailPanel.openOrReveal(submodule, prNumber);
       },
     ),
 

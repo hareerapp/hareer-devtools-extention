@@ -1,6 +1,18 @@
 import * as https from "node:https";
 import * as vscode from "vscode";
-import type { PRFile, PullRequest, ReviewComment, SubmitReviewPayload } from "./types";
+import type {
+  GitHubUser,
+  PRCheckRun,
+  PRDetail,
+  PRFile,
+  PRIssueComment,
+  PRLabel,
+  PRReview,
+  PRReviewState,
+  PullRequest,
+  ReviewComment,
+  SubmitReviewPayload,
+} from "./types";
 
 const GITHUB_AUTH_PROVIDER = "github";
 const GITHUB_SCOPES = ["repo"];
@@ -115,11 +127,12 @@ interface RawComment {
   line: number | null;
   original_line: number | null;
   side: string | null;
-  user: { login: string };
+  user: { login: string; avatar_url?: string };
   created_at: string;
   diff_hunk: string;
   commit_id: string;
   in_reply_to_id?: number;
+  pull_request_review_id?: number | null;
 }
 
 interface RawContents {
@@ -203,10 +216,12 @@ export async function fetchPRComments(
     line: c.line ?? c.original_line ?? 1,
     side: (c.side === "LEFT" ? "LEFT" : "RIGHT") as "LEFT" | "RIGHT",
     user: c.user.login,
+    userAvatarUrl: c.user.avatar_url,
     createdAt: c.created_at,
     diffHunk: c.diff_hunk,
     commitId: c.commit_id,
     inReplyToId: c.in_reply_to_id,
+    reviewId: c.pull_request_review_id ?? undefined,
   }));
 }
 
@@ -231,10 +246,12 @@ export async function replyToReviewComment(
     line: raw.line ?? raw.original_line ?? 1,
     side: (raw.side === "LEFT" ? "LEFT" : "RIGHT") as "LEFT" | "RIGHT",
     user: raw.user.login,
+    userAvatarUrl: raw.user.avatar_url,
     createdAt: raw.created_at,
     diffHunk: raw.diff_hunk,
     commitId: raw.commit_id,
     inReplyToId: raw.in_reply_to_id,
+    reviewId: raw.pull_request_review_id ?? undefined,
   };
 }
 
@@ -297,6 +314,199 @@ export async function submitReview(payload: SubmitReviewPayload): Promise<void> 
       })),
     },
   );
+}
+
+interface RawGitHubUser {
+  login: string;
+  avatar_url: string;
+}
+
+interface RawLabel {
+  name: string;
+  color: string;
+}
+
+interface RawPRDetail {
+  number: number;
+  title: string;
+  body: string | null;
+  state: string;
+  draft?: boolean;
+  merged: boolean;
+  mergeable: boolean | null;
+  mergeable_state: string;
+  html_url: string;
+  head: { sha: string; ref: string };
+  base: { sha: string; ref: string };
+  user: RawGitHubUser;
+  assignees: RawGitHubUser[];
+  requested_reviewers: RawGitHubUser[];
+  labels: RawLabel[];
+  milestone: { title: string } | null;
+  created_at: string;
+  updated_at: string;
+  commits: number;
+  additions: number;
+  deletions: number;
+  changed_files: number;
+}
+
+const GHOST_USER: GitHubUser = { login: "ghost", avatarUrl: "" };
+
+function mapUser(u: RawGitHubUser | null | undefined): GitHubUser {
+  if (!u) return GHOST_USER;
+  return { login: u.login ?? "ghost", avatarUrl: u.avatar_url ?? "" };
+}
+
+function mapLabel(l: RawLabel): PRLabel {
+  return { name: l.name, color: l.color };
+}
+
+export async function fetchPRDetail(
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PRDetail> {
+  const token = await getToken();
+  const raw = await githubRequest<RawPRDetail>(
+    "GET",
+    `/repos/${owner}/${repo}/pulls/${number}`,
+    token,
+  );
+  return {
+    number: raw.number,
+    title: raw.title,
+    body: raw.body ?? "",
+    state: raw.state === "open" ? "open" : "closed",
+    draft: Boolean(raw.draft),
+    merged: raw.merged,
+    mergeable: raw.mergeable,
+    mergeableState: raw.mergeable_state,
+    htmlUrl: raw.html_url,
+    headSha: raw.head.sha,
+    baseSha: raw.base.sha,
+    headRef: raw.head.ref,
+    baseRef: raw.base.ref,
+    author: mapUser(raw.user),
+    assignees: raw.assignees.map(mapUser),
+    requestedReviewers: raw.requested_reviewers.map(mapUser),
+    labels: raw.labels.map(mapLabel),
+    milestone: raw.milestone?.title,
+    createdAt: raw.created_at,
+    updatedAt: raw.updated_at,
+    commitsCount: raw.commits,
+    additions: raw.additions,
+    deletions: raw.deletions,
+    changedFiles: raw.changed_files,
+  };
+}
+
+interface RawReview {
+  id: number;
+  user: RawGitHubUser;
+  state: string;
+  body: string | null;
+  submitted_at: string | null;
+}
+
+export async function fetchPRReviews(
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PRReview[]> {
+  const token = await getToken();
+  const raw = await githubRequest<RawReview[]>(
+    "GET",
+    `/repos/${owner}/${repo}/pulls/${number}/reviews?per_page=100`,
+    token,
+  );
+  return raw.map((r) => ({
+    id: r.id,
+    user: mapUser(r.user),
+    state: r.state as PRReviewState,
+    body: r.body ?? "",
+    submittedAt: r.submitted_at ?? undefined,
+  }));
+}
+
+interface RawIssueComment {
+  id: number;
+  user: RawGitHubUser;
+  body: string;
+  created_at: string;
+}
+
+export async function fetchPRIssueComments(
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PRIssueComment[]> {
+  const token = await getToken();
+  const raw = await githubRequest<RawIssueComment[]>(
+    "GET",
+    `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`,
+    token,
+  );
+  return raw.map((c) => ({
+    id: c.id,
+    user: mapUser(c.user),
+    body: c.body,
+    createdAt: c.created_at,
+  }));
+}
+
+export async function createIssueComment(
+  owner: string,
+  repo: string,
+  number: number,
+  body: string,
+): Promise<void> {
+  const token = await getToken();
+  await githubRequest<unknown>(
+    "POST",
+    `/repos/${owner}/${repo}/issues/${number}/comments`,
+    token,
+    { body },
+  );
+}
+
+interface RawCheckRun {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  html_url: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
+interface RawCheckRunsResponse {
+  total_count: number;
+  check_runs: RawCheckRun[];
+}
+
+export async function fetchPRChecks(
+  owner: string,
+  repo: string,
+  sha: string,
+): Promise<PRCheckRun[]> {
+  const token = await getToken();
+  try {
+    const raw = await githubRequest<RawCheckRunsResponse>(
+      "GET",
+      `/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100`,
+      token,
+    );
+    return raw.check_runs.map((c) => ({
+      name: c.name,
+      status: c.status as PRCheckRun["status"],
+      conclusion: (c.conclusion as PRCheckRun["conclusion"]) ?? null,
+      htmlUrl: c.html_url,
+      startedAt: c.started_at,
+      completedAt: c.completed_at,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 export async function mergePR(

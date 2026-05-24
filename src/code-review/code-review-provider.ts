@@ -67,11 +67,16 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
   private submodules: Submodule[] = [];
   private readonly state = new Map<string, SubmoduleState>();
   private pendingCountFor: (submodule: Submodule, pr: PullRequest) => number = () => 0;
+  private onPRSelected: (submodule: Submodule, pr: PullRequest) => void = () => {};
 
   setPendingCountResolver(
     resolver: (submodule: Submodule, pr: PullRequest) => number,
   ): void {
     this.pendingCountFor = resolver;
+  }
+
+  setOnPRSelected(handler: (submodule: Submodule, pr: PullRequest) => void): void {
+    this.onPRSelected = handler;
   }
 
   setSubmodules(submodules: Submodule[]): void {
@@ -184,6 +189,9 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     st.loading = false;
     this._onDidChangeTreeData.fire(undefined);
 
+    // Open the PR detail panel immediately; don't make the user click the row.
+    this.onPRSelected(submodule, selectedPR);
+
     await checkoutPRBranch(submodule, selectedPR.headRef);
   }
 
@@ -245,9 +253,9 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
           item.tooltip = selectedPR.url;
           item.contextValue = pendingCount > 0 ? "prSelectorActivePending" : "prSelectorActive";
           item.command = {
-            command: "hareer.selectPR",
-            title: "Change Pull Request",
-            arguments: [node],
+            command: "hareer.openPRDetail",
+            title: "Open Pull Request",
+            arguments: [node.submodule, selectedPR.number],
           };
           return item;
         }
