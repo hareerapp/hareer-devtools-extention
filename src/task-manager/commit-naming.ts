@@ -26,10 +26,24 @@ export function formatCommitMessage(desc: CommitDescriptor): string {
   if (desc.body && desc.body.trim().length > 0) {
     lines.push("", desc.body.trim());
   }
-  if (desc.taskId) {
-    lines.push("", `CU-${desc.taskId.trim()}`);
-  }
   return lines.join("\n");
+}
+
+const GENERIC_BRANCHES = new Set(["develop", "staging", "main", "master"]);
+const TASK_BRANCH_PATTERN =
+  /^(?:feature|bugfix|hotfix|chore|refactor|docs|test|style|perf|release|build|ci)\/([^/-]+)(?:-|$)/i;
+
+/**
+ * Derive the commit scope (ClickUp task id) from a branch name.
+ * Returns undefined for generic branches (develop/staging/main) or anything
+ * that doesn't match the `<category>/<clickup_task_id>-<slug>` shape.
+ */
+export function deriveScopeFromBranch(branch: string | undefined): string | undefined {
+  if (!branch) return undefined;
+  const name = branch.trim();
+  if (GENERIC_BRANCHES.has(name.toLowerCase())) return undefined;
+  const match = name.match(TASK_BRANCH_PATTERN);
+  return match ? match[1] : undefined;
 }
 
 export interface SubjectCheck {

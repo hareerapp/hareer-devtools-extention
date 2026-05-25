@@ -1,20 +1,32 @@
 import * as vscode from "vscode";
 import {
+  aheadOfOriginInDir,
   checkoutBranch,
   checkoutBranchInDir,
   commit as gitCommit,
+  commitInDir,
   createAndCheckoutBranch,
   createAndCheckoutBranchInDir,
+  currentBranchInDir,
+  fetchOriginInDir,
   findTaskBranch,
   getDirtyStatus,
   getOriginRemote,
+  hasStagedChangesInDir,
+  hasUnpushedCommitsInDir,
+  isDirtyInDir,
+  localBranchExistsInDir,
+  originBranchExistsInDir,
   pickRepository,
   pickRepositoryForChanges,
   push as gitPush,
+  pushInDir,
+  pushRecurseSubmodulesInDir,
+  stageAllInDir,
 } from "./git-operations";
 import type { Repository } from "./git-operations";
 import { formatBranchName, validateGitRef } from "./branch-naming";
-import { formatCommitMessage } from "./commit-naming";
+import { deriveScopeFromBranch, formatCommitMessage } from "./commit-naming";
 import {
   generateCommitMessageViaCursor,
   isCursorIDE,
@@ -25,6 +37,7 @@ import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
 import { fetchOpenPRs } from "../code-review/github-api";
+import { execFile } from "node:child_process";
 import type { TaskService } from "./task-service";
 import type { BranchType, ClickUpTask, CommitType } from "./types";
 
@@ -36,13 +49,14 @@ type InboundMessage =
   | { type: "ready" }
   | { type: "refresh" }
   | { type: "openExternal"; url: string }
-  | { type: "createBranch"; branchType: BranchType; repoPaths: string[] }
+  | { type: "createBranch"; branchType: BranchType; repoPaths: string[]; baseRef: string }
   | { type: "checkoutLinkedPR" }
   | { type: "checkoutTaskBranches" }
   | { type: "openTaskReview" }
-  | { type: "commit"; commitType: CommitType; scope: string; subject: string; body: string; stageAll: boolean; thenPush: boolean }
+  | { type: "commit"; commitType: CommitType; subject: string; body: string; stageAll: boolean; thenPush: boolean; thenPR: boolean }
   | { type: "generateCommit"; stageAll: boolean }
   | { type: "push" }
+  | { type: "createPRs"; baseRef: string }
   | { type: "linkPR"; url: string };
 
 interface RepoInfo {
@@ -233,7 +247,7 @@ export class TaskDetailPanel {
         await vscode.env.openExternal(vscode.Uri.parse(msg.url));
         return;
       case "createBranch":
-        await this.handleCreateBranch(msg.branchType, msg.repoPaths);
+        await this.handleCreateBranch(msg.branchType, msg.repoPaths, msg.baseRef);
         return;
       case "checkoutLinkedPR":
         await this.handleCheckoutLinkedBranch();
@@ -253,13 +267,20 @@ export class TaskDetailPanel {
       case "push":
         await this.handlePush();
         return;
+      case "createPRs":
+        await this.handleCreatePRs(msg.baseRef);
+        return;
       case "linkPR":
         await this.handleLinkPR(msg.url);
         return;
     }
   }
 
-  private async handleCreateBranch(branchType: BranchType, repoPaths: string[]): Promise<void> {
+  private async handleCreateBranch(
+    branchType: BranchType,
+    repoPaths: string[],
+    baseRef: string,
+  ): Promise<void> {
     if (!this.state) return;
 
     const branchName = formatBranchName({
@@ -272,6 +293,7 @@ export class TaskDetailPanel {
       void vscode.window.showErrorMessage(`Hareer: Invalid branch name — ${invalid}`);
       return;
     }
+    const base = (baseRef || "develop").trim();
 
     // Multi-repo path: ≥1 repo path provided AND we have at least one submodule.
     const submoduleTargets = this.state.repos.filter(
@@ -289,7 +311,7 @@ export class TaskDetailPanel {
           const errors: string[] = [];
           for (const target of submoduleTargets) {
             try {
-              await createAndCheckoutBranchInDir(target.absPath, branchName);
+              await createAndCheckoutBranchInDir(target.absPath, branchName, base);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               errors.push(`${target.name}: ${msg}`);
@@ -325,7 +347,7 @@ export class TaskDetailPanel {
       },
       async () => {
         try {
-          await createAndCheckoutBranch(repo, branchName);
+          await createAndCheckoutBranch(repo, branchName, base);
           void vscode.window.showInformationMessage(`Hareer: Checked out ${branchName}`);
           this.postFlash(`On branch ${branchName}`);
           await this.maybeAutoTransition("in progress");
@@ -517,34 +539,395 @@ export class TaskDetailPanel {
       void vscode.window.showWarningMessage("Hareer: Commit subject is required.");
       return;
     }
-    const repo = await pickRepositoryForChanges();
-    if (!repo) return;
 
-    const message = formatCommitMessage({
-      type: msg.commitType,
-      scope: msg.scope.trim() || undefined,
-      subject: msg.subject.trim(),
-      body: msg.body.trim() || undefined,
-      taskId: this.state.task.customId ?? this.state.task.id,
-    });
+    const submodules = this.state.repos.filter((r) => r.isSubmodule);
 
-    try {
-      await gitCommit(repo, message, msg.stageAll);
-      void vscode.window.showInformationMessage("Hareer: Commit created.");
-      this.postFlash("Committed.");
-      if (msg.thenPush) {
-        await this.pushAndMaybeOfferPR(repo);
+    // Single-repo workspace (no .gitmodules): keep the old single-repo path.
+    if (submodules.length === 0) {
+      const repo = await pickRepositoryForChanges();
+      if (!repo) return;
+      const scope = deriveScopeFromBranch(repo.state.HEAD?.name);
+      const message = formatCommitMessage({
+        type: msg.commitType,
+        scope,
+        subject: msg.subject.trim(),
+        body: msg.body.trim() || undefined,
+      });
+      try {
+        await gitCommit(repo, message, msg.stageAll);
+        void vscode.window.showInformationMessage("Hareer: Commit created.");
+        this.postFlash("Committed.");
+        if (msg.thenPush) {
+          if (msg.thenPR) {
+            await this.pushAndMaybeOfferPR(repo);
+          } else {
+            await this.pushOnly(repo);
+          }
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        void vscode.window.showErrorMessage(`Hareer: Commit failed — ${errMsg}`);
       }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      void vscode.window.showErrorMessage(`Hareer: Commit failed — ${errMsg}`);
+      return;
     }
+
+    // Multi-repo (submodules): find dirty ones, align branches, commit each.
+    const dirtyTargets = await this.collectDirtySubmodules(submodules);
+    if (dirtyTargets.length === 0) {
+      void vscode.window.showInformationMessage(
+        "Hareer: No submodule has uncommitted changes.",
+      );
+      return;
+    }
+
+    const canonicalBranch = await this.pickCanonicalBranch(dirtyTargets);
+    if (!canonicalBranch) return;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Committing in ${dirtyTargets.length} repo${dirtyTargets.length === 1 ? "" : "s"}…`,
+        cancellable: false,
+      },
+      async () => {
+        const scope = deriveScopeFromBranch(canonicalBranch);
+        const message = formatCommitMessage({
+          type: msg.commitType,
+          scope,
+          subject: msg.subject.trim(),
+          body: msg.body.trim() || undefined,
+        });
+
+        const errors: string[] = [];
+        const committed: typeof dirtyTargets = [];
+        for (const target of dirtyTargets) {
+          try {
+            if (msg.stageAll) await stageAllInDir(target.absPath);
+            if (!(await hasStagedChangesInDir(target.absPath))) continue;
+            await commitInDir(target.absPath, message);
+            committed.push(target);
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            errors.push(`${target.name}: ${errMsg}`);
+          }
+        }
+
+        if (committed.length > 0) {
+          this.postFlash(`Committed in ${committed.length} repo${committed.length === 1 ? "" : "s"}.`);
+          void vscode.window.showInformationMessage(
+            `Hareer: Commit created in ${committed.length} repo${committed.length === 1 ? "" : "s"}.`,
+          );
+        }
+        if (errors.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: Commit failed in ${errors.length} repo${errors.length === 1 ? "" : "s"} — ${errors[0]}`,
+          );
+        }
+
+        if (msg.thenPush && committed.length > 0) {
+          await this.pushSubmodules(committed.map((c) => c.absPath), canonicalBranch);
+          if (msg.thenPR) {
+            await this.maybeOfferCreatePRMultiRepo(committed, canonicalBranch);
+          }
+        }
+
+        void this.discoverContext();
+      },
+    );
+  }
+
+  private async collectDirtySubmodules(
+    submodules: RepoInfo[],
+  ): Promise<RepoInfo[]> {
+    const checks = await Promise.all(
+      submodules.map(async (r) => ((await isDirtyInDir(r.absPath)) ? r : null)),
+    );
+    return checks.filter((r): r is RepoInfo => r !== null);
+  }
+
+  private async pickCanonicalBranch(
+    targets: RepoInfo[],
+  ): Promise<string | undefined> {
+    const branches = await Promise.all(
+      targets.map(async (t) => ({ repo: t, branch: await currentBranchInDir(t.absPath) })),
+    );
+    const named = branches.filter((b): b is { repo: RepoInfo; branch: string } => Boolean(b.branch));
+    if (named.length === 0) {
+      void vscode.window.showErrorMessage("Hareer: Could not determine current branch in any repo.");
+      return undefined;
+    }
+    const unique = Array.from(new Set(named.map((b) => b.branch)));
+    if (unique.length === 1) return unique[0];
+
+    // Repos sit on different branches — let the user pick a canonical one.
+    const picked = await vscode.window.showQuickPick(
+      unique.map((b) => ({
+        label: b,
+        description: named
+          .filter((n) => n.branch === b)
+          .map((n) => n.repo.name)
+          .join(", "),
+      })),
+      {
+        placeHolder: "Submodules are on different branches — pick the canonical branch for this commit",
+      },
+    );
+    return picked?.label;
+  }
+
+  private async pushSubmodules(
+    absPaths: string[],
+    branch: string,
+  ): Promise<void> {
+    for (const cwd of absPaths) {
+      try {
+        if (await aheadOfOriginInDir(cwd, branch)) {
+          await pushInDir(cwd, branch);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        void vscode.window.showWarningMessage(`Hareer: Push failed for ${cwd} — ${msg}`);
+      }
+    }
+    this.postFlash("Pushed to origin.");
+  }
+
+  private async maybeOfferCreatePRMultiRepo(
+    committed: RepoInfo[],
+    branch: string,
+  ): Promise<void> {
+    if (!this.state) return;
+    const fieldName = vscode.workspace
+      .getConfiguration("hareer.clickup")
+      .get<string>("prUrlFieldName", "Github PR Url");
+    const existing = getLinkedPR(this.state.task, fieldName);
+    if (existing) return;
+    const eligible = committed.filter((c) => c.owner && c.repo);
+    if (eligible.length === 0) return;
+
+    const baseRef = await this.pickPRBase();
+    if (!baseRef) return;
+    await this.createPRsForBranch(eligible, branch, baseRef);
+  }
+
+  private async pickPRBase(): Promise<string | undefined> {
+    const cfg = vscode.workspace.getConfiguration("hareer.git");
+    const options = cfg.get<string[]>("baseBranches", ["develop", "staging", "main"]);
+    const def = cfg.get<string>("defaultBaseBranch", "develop");
+    const picked = await vscode.window.showQuickPick(
+      options.map((b) => ({ label: b, description: b === def ? "default" : undefined })),
+      { placeHolder: "Pick base branch for the pull requests" },
+    );
+    return picked?.label;
+  }
+
+  /** Drives `gh pr create` across submodule paths, mirroring `make new-pr`. */
+  private async createPRsForBranch(
+    targets: RepoInfo[],
+    branch: string,
+    baseRef: string,
+  ): Promise<void> {
+    if (!(await ghIsAvailable())) {
+      void vscode.window.showErrorMessage(
+        "Hareer: `gh` (GitHub CLI) is required to create PRs. Install it and run `gh auth login`.",
+      );
+      return;
+    }
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Creating PRs for ${branch}…`,
+        cancellable: false,
+      },
+      async () => {
+        const created: { repo: RepoInfo; url: string }[] = [];
+        const skipped: string[] = [];
+        const errors: string[] = [];
+
+        for (const target of targets) {
+          if (!target.owner || !target.repo) continue;
+          try {
+            await fetchOriginInDir(target.absPath);
+
+            const localExists = await localBranchExistsInDir(target.absPath, branch);
+            const remoteExists = await originBranchExistsInDir(target.absPath, branch);
+            if (!localExists && !remoteExists) {
+              skipped.push(`${target.name} (branch not found)`);
+              continue;
+            }
+
+            // Push branch if it's local-only or ahead of origin.
+            if (localExists && (!remoteExists || (await aheadOfOriginInDir(target.absPath, branch)))) {
+              try {
+                await pushInDir(target.absPath, branch);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                errors.push(`${target.name}: push failed — ${msg}`);
+                continue;
+              }
+            }
+
+            // Skip if an open PR already exists for this head.
+            try {
+              const prs = await fetchOpenPRs(target.owner, target.repo);
+              const existing = prs.find((p) => p.headRef === branch);
+              if (existing) {
+                skipped.push(`${target.name} (PR #${existing.number} already open)`);
+                continue;
+              }
+            } catch {
+              /* fall through and attempt creation; gh will error if dup */
+            }
+
+            const url = await ghPRCreate(target.absPath, baseRef, branch);
+            created.push({ repo: target, url });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push(`${target.name}: ${msg}`);
+          }
+        }
+
+        if (created.length > 0) {
+          void vscode.window.showInformationMessage(
+            `Hareer: Opened ${created.length} PR${created.length === 1 ? "" : "s"} — ${created.map((c) => c.repo.name).join(", ")}.`,
+          );
+          // Link the first newly-created PR to ClickUp (best-effort).
+          await this.handleLinkPR(created[0].url);
+        }
+        if (skipped.length > 0) {
+          void vscode.window.showInformationMessage(
+            `Hareer: Skipped — ${skipped.join("; ")}`,
+          );
+        }
+        if (errors.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: PR creation failed — ${errors.join("; ")}`,
+          );
+        }
+        void this.discoverContext();
+      },
+    );
+  }
+
+  private async handleCreatePRs(_baseRef: string): Promise<void> {
+    if (!this.state) return;
+    const ghCandidates = this.state.repos.filter(
+      (r): r is RepoInfo & { owner: string; repo: string } => Boolean(r.owner && r.repo),
+    );
+    if (ghCandidates.length === 0) {
+      void vscode.window.showWarningMessage(
+        "Hareer: No GitHub remote detected in the workspace.",
+      );
+      return;
+    }
+    const baseRef = await this.pickPRBase();
+    if (!baseRef) return;
+    const targetsByPath = new Map<string, RepoInfo>();
+    for (const r of ghCandidates) targetsByPath.set(r.path, r);
+
+    // Group branchMatches by branch; the most-common task branch wins.
+    const branchCounts = new Map<string, number>();
+    for (const b of this.state.branchMatches) {
+      branchCounts.set(b.branch, (branchCounts.get(b.branch) ?? 0) + 1);
+    }
+    let branch: string | undefined;
+    if (branchCounts.size === 1) {
+      branch = [...branchCounts.keys()][0];
+    } else if (branchCounts.size > 1) {
+      const picked = await vscode.window.showQuickPick(
+        [...branchCounts.entries()].map(([b, n]) => ({
+          label: b,
+          description: `${n} repo${n === 1 ? "" : "s"}`,
+        })),
+        { placeHolder: "Pick the task branch to open PRs for" },
+      );
+      branch = picked?.label;
+    }
+    if (!branch) {
+      // No matches detected — ask the user to type the branch.
+      branch = await vscode.window.showInputBox({
+        prompt: "Task branch name to open PRs for",
+        placeHolder: "feature/86ex9cp7m-…",
+      });
+      if (!branch) return;
+    }
+
+    const targets = this.state.branchMatches.length > 0
+      ? this.state.branchMatches
+          .map((b) => targetsByPath.get(b.repoPath))
+          .filter((r): r is RepoInfo => Boolean(r))
+      : ghCandidates;
+
+    await this.createPRsForBranch(targets, branch, baseRef);
   }
 
   private async handlePush(): Promise<void> {
-    const repo = await pickRepository();
-    if (!repo) return;
-    await this.pushAndMaybeOfferPR(repo);
+    if (!this.state) return;
+    const submodules = this.state.repos.filter((r) => r.isSubmodule);
+
+    // Single-repo workspace: legacy path through the vscode.git API.
+    if (submodules.length === 0) {
+      const repo = await pickRepository();
+      if (!repo) return;
+      await this.pushAndMaybeOfferPR(repo);
+      return;
+    }
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Pushing submodules…",
+        cancellable: false,
+      },
+      async () => {
+        const pushed: { repo: RepoInfo; branch: string }[] = [];
+        const errors: string[] = [];
+
+        for (const target of submodules) {
+          const branch = await currentBranchInDir(target.absPath);
+          if (!branch) continue;
+          try {
+            if (!(await hasUnpushedCommitsInDir(target.absPath))) continue;
+            await pushInDir(target.absPath, branch);
+            pushed.push({ repo: target, branch });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push(`${target.name}: ${msg}`);
+          }
+        }
+
+        // Umbrella: if the workspace root is itself a repo and has pointer
+        // updates (or any unpushed commits), push with --recurse-submodules.
+        const umbrellaPath = this.state?.repos.find((r) => r.path === ".")?.absPath
+          ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (umbrellaPath) {
+          try {
+            const umbrellaBranch = await currentBranchInDir(umbrellaPath);
+            if (umbrellaBranch && (await hasUnpushedCommitsInDir(umbrellaPath))) {
+              await pushRecurseSubmodulesInDir(umbrellaPath);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            errors.push(`umbrella: ${msg}`);
+          }
+        }
+
+        if (pushed.length > 0) {
+          this.postFlash(`Pushed ${pushed.length} repo${pushed.length === 1 ? "" : "s"}.`);
+          void vscode.window.showInformationMessage(
+            `Hareer: Pushed ${pushed.map((p) => `${p.repo.name}:${p.branch}`).join(", ")}.`,
+          );
+        } else if (errors.length === 0) {
+          void vscode.window.showInformationMessage("Hareer: Nothing to push.");
+        }
+        if (errors.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: Push failed — ${errors.join("; ")}`,
+          );
+        }
+      },
+    );
   }
 
   private async pushAndMaybeOfferPR(repo: Repository): Promise<void> {
@@ -561,6 +944,26 @@ export class TaskDetailPanel {
           void vscode.window.showInformationMessage("Hareer: Pushed.");
           this.postFlash("Pushed to origin.");
           await this.maybeOfferCreatePR(repo);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          void vscode.window.showErrorMessage(`Hareer: Push failed — ${msg}`);
+        }
+      },
+    );
+  }
+
+  private async pushOnly(repo: Repository): Promise<void> {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Pushing…",
+        cancellable: false,
+      },
+      async () => {
+        try {
+          await gitPush(repo);
+          void vscode.window.showInformationMessage("Hareer: Pushed.");
+          this.postFlash("Pushed to origin.");
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           void vscode.window.showErrorMessage(`Hareer: Push failed — ${msg}`);
@@ -702,6 +1105,12 @@ export class TaskDetailPanel {
       branchTypes: vscode.workspace
         .getConfiguration("hareer.clickup")
         .get<string[]>("branchTypes", ["feature", "bugfix", "hotfix", "chore", "docs", "refactor"]),
+      baseBranches: vscode.workspace
+        .getConfiguration("hareer.git")
+        .get<string[]>("baseBranches", ["develop", "staging", "main"]),
+      defaultBaseBranch: vscode.workspace
+        .getConfiguration("hareer.git")
+        .get<string>("defaultBaseBranch", "develop"),
       dirty: getCurrentDirtyStatus(),
       repos: this.state.repos.map((r) => ({
         name: r.name,
@@ -815,6 +1224,49 @@ function randomNonce(): string {
   let out = "";
   for (let i = 0; i < 32; i++) out += chars[Math.floor(Math.random() * chars.length)];
   return out;
+}
+
+function runCommand(
+  cmd: string,
+  args: string[],
+  cwd?: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { cwd, timeout: 60_000 }, (err, stdout, stderr) => {
+      if (err) reject(new Error((stderr || stdout || err.message).trim()));
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+async function ghIsAvailable(): Promise<boolean> {
+  try {
+    await runCommand("gh", ["--version"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ghPRCreate(
+  cwd: string,
+  baseRef: string,
+  branch: string,
+): Promise<string> {
+  // Mirror `scripts/new-pr.ts`: --title is the branch name; body is left to
+  // the user / repo template. `gh` prints the new PR URL on stdout.
+  const out = await runCommand(
+    "gh",
+    ["pr", "create", "--base", baseRef, "--head", branch, "--title", branch, "--body", ""],
+    cwd,
+  );
+  const url = out
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .reverse()
+    .find((l) => /^https:\/\/github\.com\//.test(l));
+  if (!url) throw new Error(`gh pr create returned no URL: ${out}`);
+  return url;
 }
 
 async function fetchPRHeadRef(owner: string, repo: string, number: number): Promise<string> {
@@ -1067,7 +1519,7 @@ const WEBVIEW_JS = `
 const vscode = acquireVsCodeApi();
 const root = document.getElementById("root");
 let model = null;
-let savedState = vscode.getState() || { commitSubject: "", commitScope: "", commitBody: "", commitType: "feat", branchType: null, stageAll: true, selectedRepoPaths: null, descriptionExpanded: false, showCommitSection: false, showPRSection: false, showBranchSection: false };
+let savedState = vscode.getState() || { commitSubject: "", commitBody: "", commitType: "feat", branchType: null, baseRef: null, stageAll: true, selectedRepoPaths: null, descriptionExpanded: false, showCommitSection: false, showBranchSection: false };
 
 function escape(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}[c]));
@@ -1198,12 +1650,20 @@ function branchPreview(type) {
   return type + "/" + model.task.customId + "-" + slugify(model.task.name, 50);
 }
 
+function deriveScopeFromBranch(branch) {
+  if (!branch) return "";
+  const name = String(branch).trim();
+  if (["develop","staging","main","master"].includes(name.toLowerCase())) return "";
+  const m = name.match(/^(?:feature|bugfix|hotfix|chore|refactor|docs|test|style|perf|release|build|ci)\\/([^/-]+)(?:-|$)/i);
+  return m ? m[1] : "";
+}
+
 function commitPreview() {
   const t = savedState.commitType;
-  const scope = (savedState.commitScope || "").trim();
+  const branch = (model && model.dirty && model.dirty.branch) || "";
+  const scope = deriveScopeFromBranch(branch);
   const subject = (savedState.commitSubject || "").trim() || "<subject>";
-  const head = scope ? t + "(" + scope + "): " + subject : t + ": " + subject;
-  return head + "\\n\\nCU-" + model.task.customId;
+  return scope ? t + "(" + scope + "): " + subject : t + ": " + subject;
 }
 
 function userInitial(name) {
@@ -1221,6 +1681,10 @@ function render() {
   const linked = model.linkedPR;
   const branchTypes = model.branchTypes;
   if (!savedState.branchType) savedState.branchType = branchTypes[0];
+  const baseBranches = model.baseBranches || ["develop", "staging", "main"];
+  if (!savedState.baseRef || !baseBranches.includes(savedState.baseRef)) {
+    savedState.baseRef = model.defaultBaseBranch || baseBranches[0] || "develop";
+  }
 
   const statusBg = 'color-mix(in srgb, ' + t.status.color + ' 14%, transparent)';
   const statusBorder = 'color-mix(in srgb, ' + t.status.color + ' 50%, transparent)';
@@ -1279,6 +1743,11 @@ function render() {
     );
   }
   actionBtns.push('<button class="action-btn" id="action-commit">Commit</button>');
+  actionBtns.push(
+    '<button class="action-btn" id="action-link-pr" title="' + (linked ? 'Replace the linked PR URL on this ClickUp task' : 'Paste an existing PR URL to link it to this ClickUp task') + '">' +
+      (linked ? '🔗 Replace link' : '🔗 Link existing PR') +
+    '</button>',
+  );
   const actionsHtml = '<div class="task-actions">' + actionBtns.join('') + '</div>';
 
   // Determine which repos are selected for branch creation. Default: all submodules
@@ -1329,47 +1798,15 @@ function render() {
               branchTypes.map((bt) => '<button class="chip ' + (savedState.branchType === bt ? "active" : "") + '" data-bt="' + escape(bt) + '">' + escape(bt) + '</button>').join('') +
             '</div>' +
           '</div>' +
+          '<div class="row">' +
+            '<label>Base</label>' +
+            '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
+              baseBranches.map((b) => '<button class="chip ' + (savedState.baseRef === b ? "active" : "") + '" data-base="' + escape(b) + '">' + escape(b) + '</button>').join('') +
+            '</div>' +
+          '</div>' +
           repoPillsHtml +
           '<div class="preview" id="branch-preview"></div>' +
           '<div class="row" style="margin-top:10px"><button class="primary" id="create-branch-btn">Create branch & checkout</button></div>' +
-        '</div>' +
-      '</div>'
-    : '';
-
-  const prSectionHtml = savedState.showPRSection
-    ? '<div class="collapsible-section">' +
-        '<h2>GitHub PR</h2>' +
-        '<div class="pr-card">' +
-          (linked ? (
-            '<div class="pr-linked-head">' +
-              '<span class="linked-pill">Linked</span>' +
-              '<span class="pr-num">#' + linked.number + '</span>' +
-              '<span class="muted">' + escape(linked.owner) + '/' + escape(linked.repo) + '</span>' +
-              '<span class="spacer"></span>' +
-              '<a href="' + escape(linked.url) + '" data-external="1" style="margin-left:auto;color:var(--vscode-textLink-foreground);text-decoration:none">Open on GitHub ↗</a>' +
-            '</div>' +
-            '<div class="row">' +
-              '<button class="primary" id="checkout-btn">Checkout PR branch</button>' +
-              '<button class="secondary" id="relink-btn">Replace link…</button>' +
-            '</div>'
-          ) : (
-            '<p class="muted" style="margin:0 0 10px">Open GitHub to create a pull request, then link it to this task.</p>' +
-            (model.branchMatches || []).map((b) => {
-              const repo = (model.repos || []).find((r) => r.path === b.repoPath);
-              const gh = repo && repo.owner && repo.repo
-                ? 'https://github.com/' + encodeURIComponent(repo.owner) + '/' + encodeURIComponent(repo.repo) + '/pull/new/' + encodeURIComponent(b.branch)
-                : '';
-              return '<div class="row">' +
-                '<span><strong>' + escape(b.repoName) + '</strong> · <code>' + escape(b.branch) + '</code></span>' +
-                (gh ? '<a href="' + escape(gh) + '" data-external="1" style="margin-left:auto;color:var(--vscode-textLink-foreground);text-decoration:none;font-size:0.85rem">Open Create PR ↗</a>' : '') +
-              '</div>';
-            }).join('') +
-            '<div class="row" style="margin-top:12px;flex-wrap:nowrap">' +
-              '<label style="flex-shrink:0">Link PR</label>' +
-              '<input type="text" id="link-pr-input" placeholder="https://github.com/owner/repo/pull/123" style="flex:1" />' +
-              '<button class="primary" id="link-pr-btn" style="flex-shrink:0">Link</button>' +
-            '</div>'
-          )) +
         '</div>' +
       '</div>'
     : '';
@@ -1385,8 +1822,6 @@ function render() {
                 '<button class="chip ' + (savedState.commitType === ct ? "active" : "") + '" data-ct="' + ct + '">' + ct + '</button>'
               ).join('') +
             '</div>' +
-            '<label>Scope</label>' +
-            '<input type="text" id="scope-input" value="' + escape(savedState.commitScope || "") + '" placeholder="optional (e.g. auth)" style="max-width:240px" />' +
             '<label>Subject</label>' +
             '<div class="subject-row">' +
               '<input type="text" id="subject-input" value="' + escape(savedState.commitSubject || "") + '" placeholder="short imperative summary" />' +
@@ -1404,9 +1839,10 @@ function render() {
           '<div class="action-row">' +
             '<label class="checkbox-row"><input type="checkbox" id="stage-all"' + (savedState.stageAll ? " checked" : "") + ' />Stage all changes</label>' +
             '<span class="spacer"></span>' +
-            '<button class="secondary" id="commit-btn">Commit</button>' +
-            '<button class="primary" id="commit-push-btn">Commit & Push</button>' +
-            '<button class="secondary" id="push-btn">Push only</button>' +
+            '<button class="secondary" id="commit-btn" title="Commit without pushing">Commit</button>' +
+            '<button class="secondary" id="commit-push-btn" title="Commit and push, no PR">Commit & Push</button>' +
+            '<button class="primary" id="commit-push-pr-btn" title="Commit, push, and open pull requests">Commit, Push & PR</button>' +
+            '<button class="secondary" id="push-btn" title="Push existing commits">Push only</button>' +
           '</div>' +
           (model.dirty ? '<div class="dirty-status">' +
             '<span>Branch: <strong>' + escape(model.dirty.branch) + '</strong></span>' +
@@ -1435,7 +1871,6 @@ function render() {
         descBody +
         actionsHtml +
         branchSectionHtml +
-        prSectionHtml +
         commitSectionHtml +
       '</div>' +
 
@@ -1495,6 +1930,13 @@ function bindEvents() {
       render();
     });
   });
+  document.querySelectorAll("[data-base]").forEach((el) => {
+    el.addEventListener("click", () => {
+      savedState.baseRef = el.getAttribute("data-base");
+      saveDraft();
+      render();
+    });
+  });
   document.querySelectorAll("[data-ct]").forEach((el) => {
     el.addEventListener("click", () => {
       savedState.commitType = el.getAttribute("data-ct");
@@ -1507,11 +1949,6 @@ function bindEvents() {
   if (subj) {
     subj.addEventListener("input", (e) => { savedState.commitSubject = e.target.value; saveDraft(); updatePreviews(); });
     subj.addEventListener("keydown", commitKeydown);
-  }
-  const scope = document.getElementById("scope-input");
-  if (scope) {
-    scope.addEventListener("input", (e) => { savedState.commitScope = e.target.value; saveDraft(); updatePreviews(); });
-    scope.addEventListener("keydown", commitKeydown);
   }
   const body = document.getElementById("body-input");
   if (body) {
@@ -1530,11 +1967,9 @@ function bindEvents() {
       type: "createBranch",
       branchType: savedState.branchType,
       repoPaths: savedState.selectedRepoPaths || [],
+      baseRef: savedState.baseRef || "develop",
     });
   });
-  const checkout = document.getElementById("checkout-btn");
-  if (checkout) checkout.addEventListener("click", () => vscode.postMessage({ type: "checkoutLinkedPR" }));
-
   const actionCheckout = document.getElementById("action-checkout");
   if (actionCheckout) actionCheckout.addEventListener("click", () => vscode.postMessage({ type: "checkoutTaskBranches" }));
   const actionCreateBranch = document.getElementById("action-create-branch");
@@ -1545,9 +1980,10 @@ function bindEvents() {
   });
   const actionCreatePR = document.getElementById("action-create-pr");
   if (actionCreatePR) actionCreatePR.addEventListener("click", () => {
-    savedState.showPRSection = true;
-    saveDraft();
-    render();
+    vscode.postMessage({
+      type: "createPRs",
+      baseRef: savedState.baseRef || (model && model.defaultBaseBranch) || "develop",
+    });
   });
   const actionReview = document.getElementById("action-review");
   if (actionReview) actionReview.addEventListener("click", () => vscode.postMessage({ type: "openTaskReview" }));
@@ -1556,6 +1992,12 @@ function bindEvents() {
     savedState.showCommitSection = true;
     saveDraft();
     render();
+  });
+  const actionLinkPR = document.getElementById("action-link-pr");
+  if (actionLinkPR) actionLinkPR.addEventListener("click", () => {
+    const current = model && model.linkedPR ? model.linkedPR.url : "";
+    const url = prompt("Paste GitHub PR URL", current);
+    if (url) vscode.postMessage({ type: "linkPR", url: url.trim() });
   });
 
   // Repo multi-select pills
@@ -1604,9 +2046,11 @@ function bindEvents() {
   });
 
   const commit = document.getElementById("commit-btn");
-  if (commit) commit.addEventListener("click", () => sendCommit(false));
+  if (commit) commit.addEventListener("click", () => sendCommit(false, false));
   const commitPush = document.getElementById("commit-push-btn");
-  if (commitPush) commitPush.addEventListener("click", () => sendCommit(true));
+  if (commitPush) commitPush.addEventListener("click", () => sendCommit(true, false));
+  const commitPushPR = document.getElementById("commit-push-pr-btn");
+  if (commitPushPR) commitPushPR.addEventListener("click", () => sendCommit(true, true));
   const push = document.getElementById("push-btn");
   if (push) push.addEventListener("click", () => vscode.postMessage({ type: "push" }));
   const generateCommit = document.getElementById("generate-commit-btn");
@@ -1614,38 +2058,25 @@ function bindEvents() {
     vscode.postMessage({ type: "generateCommit", stageAll: !!savedState.stageAll });
   });
 
-  const relink = document.getElementById("relink-btn");
-  if (relink) relink.addEventListener("click", () => {
-    const url = prompt("Paste new GitHub PR URL", model.linkedPR ? model.linkedPR.url : "");
-    if (url) vscode.postMessage({ type: "linkPR", url: url.trim() });
-  });
-
-  const linkPrBtn = document.getElementById("link-pr-btn");
-  if (linkPrBtn) linkPrBtn.addEventListener("click", () => {
-    const input = document.getElementById("link-pr-input");
-    const url = input ? input.value.trim() : "";
-    if (!url) { flash("Paste a GitHub PR URL first."); return; }
-    vscode.postMessage({ type: "linkPR", url: url });
-  });
 }
 
 function commitKeydown(e) {
   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
     e.preventDefault();
-    sendCommit(false);
+    sendCommit(false, false);
   }
 }
 
-function sendCommit(thenPush) {
+function sendCommit(thenPush, thenPR) {
   if (!(savedState.commitSubject || "").trim()) { flash("Subject is required."); return; }
   vscode.postMessage({
     type: "commit",
     commitType: savedState.commitType,
-    scope: savedState.commitScope || "",
     subject: savedState.commitSubject || "",
     body: savedState.commitBody || "",
     stageAll: !!savedState.stageAll,
     thenPush: thenPush,
+    thenPR: thenPR,
   });
 }
 
@@ -1656,7 +2087,6 @@ window.addEventListener("message", (e) => {
     render();
   } else if (msg.type === "commitDraft") {
     savedState.commitType = msg.commitType || savedState.commitType;
-    savedState.commitScope = msg.scope || "";
     savedState.commitSubject = msg.subject || "";
     savedState.commitBody = msg.body || "";
     savedState.showCommitSection = true;
