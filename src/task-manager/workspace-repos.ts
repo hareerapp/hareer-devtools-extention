@@ -12,6 +12,15 @@ export interface WorkspaceRepo {
   readonly isSubmodule: boolean;
 }
 
+async function hasGitCheckout(absPath: string): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(vscode.Uri.file(path.join(absPath, ".git")));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve all git repos accessible from the active workspace.
  *
@@ -32,7 +41,7 @@ export async function getWorkspaceRepos(): Promise<WorkspaceRepo[]> {
     const text = new TextDecoder("utf-8").decode(bytes);
     const submodules = parseGitmodules(text);
     if (submodules.length > 0) {
-      return submodules.map((s) => ({
+      const candidates: WorkspaceRepo[] = submodules.map((s) => ({
         name: s.name,
         path: s.path,
         absPath: path.join(rootPath, s.path),
@@ -40,6 +49,11 @@ export async function getWorkspaceRepos(): Promise<WorkspaceRepo[]> {
         repo: s.repo,
         isSubmodule: true,
       }));
+      const checked = await Promise.all(
+        candidates.map(async (c) => ((await hasGitCheckout(c.absPath)) ? c : null)),
+      );
+      const initialized = checked.filter((c): c is WorkspaceRepo => c !== null);
+      if (initialized.length > 0) return initialized;
     }
   } catch {
     /* no .gitmodules — fall through to single-repo case */

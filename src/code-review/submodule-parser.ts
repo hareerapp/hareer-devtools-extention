@@ -31,8 +31,10 @@ export function parseGitmodules(content: string): Submodule[] {
 
     const pathMatch = block.match(/^\s*path\s*=\s*(.+)$/m);
     const urlMatch = block.match(/^\s*url\s*=\s*(.+)$/m);
+    const activeMatch = block.match(/^\s*active\s*=\s*(.+)$/m);
 
     if (!pathMatch || !urlMatch) continue;
+    if (activeMatch && /^(false|no|0|off)$/i.test(activeMatch[1].trim())) continue;
 
     const subPath = pathMatch[1].trim();
     const url = urlMatch[1].trim();

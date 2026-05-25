@@ -2,7 +2,7 @@
   "name": "hareer-devtools",
   "displayName": "Hareer DevTools",
   "description": "ClickUp task manager, code review, and Makefile runner for the Hareer monorepo.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "Hareer-Team",
   "private": true,
   "repository": {
@@ -246,6 +246,17 @@
           "type": "number",
           "default": 0,
           "description": "Auto-refresh task list at this interval (ms). 0 disables polling."
+        },
+        "hareer.git.baseBranches": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["develop", "staging", "main"],
+          "description": "Branches offered as the base when creating a task branch."
+        },
+        "hareer.git.defaultBaseBranch": {
+          "type": "string",
+          "default": "develop",
+          "description": "Default base branch used when creating task branches."
         }
       }
     }

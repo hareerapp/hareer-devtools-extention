@@ -196,13 +196,15 @@ export async function checkoutBranchInDir(cwd: string, branch: string): Promise<
 }
 
 /**
- * Create a branch (off origin/<default>) and check it out, via shell.
+ * Create a branch (off origin/<base>) and check it out, via shell.
  * Used for multi-repo branch creation where vscode.git Repository objects
- * aren't available for each submodule.
+ * aren't available for each submodule. When `baseRef` is omitted falls back
+ * to `develop`, then `origin/HEAD`, then `main`.
  */
 export async function createAndCheckoutBranchInDir(
   cwd: string,
   branchName: string,
+  baseRef?: string,
 ): Promise<void> {
   try {
     await execGit(cwd, ["fetch", "origin"]);
@@ -210,13 +212,7 @@ export async function createAndCheckoutBranchInDir(
     /* offline or no remote */
   }
 
-  let base = "main";
-  try {
-    const head = await execGit(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]);
-    base = head.split("/").pop() || base;
-  } catch {
-    /* fall back to "main" */
-  }
+  const base = baseRef ?? (await resolveDefaultBase(cwd));
 
   try {
     await execGit(cwd, ["checkout", "-b", branchName, `origin/${base}`]);
@@ -230,20 +226,26 @@ export async function createAndCheckoutBranchInDir(
   }
 }
 
-export async function getDefaultBranch(repo: Repository): Promise<string> {
-  const remote = repo.state.remotes.find((r) => r.name === "origin") ?? repo.state.remotes[0];
-  if (!remote) return "main";
+async function resolveDefaultBase(cwd: string): Promise<string> {
+  // Prefer develop (umbrella convention) when it exists on origin.
   try {
-    const out = await execGit(repo.rootUri.fsPath, [
-      "symbolic-ref",
-      `refs/remotes/${remote.name}/HEAD`,
-      "--short",
-    ]);
-    const parts = out.split("/");
-    return parts[parts.length - 1] || "main";
+    await execGit(cwd, ["rev-parse", "--verify", "refs/remotes/origin/develop"]);
+    return "develop";
   } catch {
-    return "main";
+    /* no develop branch */
   }
+  try {
+    const head = await execGit(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"]);
+    const tip = head.split("/").pop();
+    if (tip) return tip;
+  } catch {
+    /* no origin HEAD */
+  }
+  return "main";
+}
+
+export async function getDefaultBranch(repo: Repository): Promise<string> {
+  return resolveDefaultBase(repo.rootUri.fsPath);
 }
 
 export async function createAndCheckoutBranch(
@@ -336,6 +338,105 @@ export function parseGitHubRemote(url: string): { owner: string; repo: string } 
   const https = url.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?(?:\/)?$/);
   if (https) return { owner: https[1], repo: https[2] };
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-repo shell helpers (used when iterating over submodule paths
+// directly, without needing a vscode.git Repository object per submodule).
+// ---------------------------------------------------------------------------
+
+export async function isDirtyInDir(cwd: string): Promise<boolean> {
+  try {
+    const out = await execGit(cwd, ["status", "--porcelain"]);
+    return out.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function currentBranchInDir(cwd: string): Promise<string | undefined> {
+  try {
+    const out = await execGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    return out === "HEAD" ? undefined : out;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function stageAllInDir(cwd: string): Promise<void> {
+  await execGit(cwd, ["add", "-A"]);
+}
+
+export async function hasStagedChangesInDir(cwd: string): Promise<boolean> {
+  try {
+    await execGit(cwd, ["diff", "--cached", "--quiet"]);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export async function commitInDir(cwd: string, message: string): Promise<void> {
+  await execGit(cwd, ["commit", "-m", message]);
+}
+
+export async function pushInDir(cwd: string, branch: string): Promise<void> {
+  // -u so the first push from a fresh task branch sets upstream.
+  await execGit(cwd, ["push", "-u", "origin", branch]);
+}
+
+export async function aheadOfOriginInDir(cwd: string, branch: string): Promise<boolean> {
+  try {
+    // Returns count of commits on local that origin doesn't have.
+    const out = await execGit(cwd, [
+      "rev-list",
+      "--count",
+      `origin/${branch}..${branch}`,
+    ]);
+    return Number(out.trim()) > 0;
+  } catch {
+    // No upstream → treat as ahead so the caller pushes with -u.
+    return true;
+  }
+}
+
+export async function originBranchExistsInDir(cwd: string, branch: string): Promise<boolean> {
+  try {
+    await execGit(cwd, ["rev-parse", "--verify", `refs/remotes/origin/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function localBranchExistsInDir(cwd: string, branch: string): Promise<boolean> {
+  try {
+    await execGit(cwd, ["rev-parse", "--verify", `refs/heads/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchOriginInDir(cwd: string): Promise<void> {
+  try {
+    await execGit(cwd, ["fetch", "origin", "--prune"]);
+  } catch {
+    /* offline / no remote */
+  }
+}
+
+export async function pushRecurseSubmodulesInDir(cwd: string): Promise<void> {
+  await execGit(cwd, ["push", "--recurse-submodules=on-demand"]);
+}
+
+export async function hasUnpushedCommitsInDir(cwd: string): Promise<boolean> {
+  try {
+    const out = await execGit(cwd, ["log", "@{u}..", "--oneline"]);
+    return out.trim().length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export type { Repository, GitAPI };
