@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { fetchOpenPRs, fetchPRFiles } from "./github-api";
+import { getOpenPRs, getPRFiles } from "./pr-cache";
 import { checkoutPRBranch } from "./git-checkout";
 import type { PRFile, PullRequest, Submodule } from "./types";
 
@@ -99,7 +99,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
     let prs: PullRequest[];
     try {
-      prs = await fetchOpenPRs(submodule.owner, submodule.repo);
+      prs = await getOpenPRs(submodule.owner, submodule.repo);
     } catch (err) {
       st.loading = false;
       this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
@@ -174,7 +174,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
     let files: PRFile[];
     try {
-      files = await fetchPRFiles(submodule.owner, submodule.repo, selectedPR.number);
+      files = await getPRFiles(submodule.owner, submodule.repo, selectedPR.number);
     } catch (err) {
       st.loading = false;
       this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
@@ -195,12 +195,6 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     await checkoutPRBranch(submodule, selectedPR.headRef);
   }
 
-  /**
-   * Select a specific PR without the QuickPick. Used when the caller already
-   * knows the PR number (e.g. driven from the Task Manager "Code Review" button).
-   * Pass `openDetail=false` to display the PR only inside the Code Review tree
-   * without opening the standalone PR detail webview panel.
-   */
   async selectPRByNumber(
     submodule: Submodule,
     prNumber: number,
@@ -224,7 +218,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
     let files: PRFile[];
     try {
-      files = await fetchPRFiles(submodule.owner, submodule.repo, prNumber);
+      files = await getPRFiles(submodule.owner, submodule.repo, prNumber);
     } catch (err) {
       st.loading = false;
       this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });

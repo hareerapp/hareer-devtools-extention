@@ -1,14 +1,7 @@
 import * as vscode from "vscode";
-import {
-  createIssueComment,
-  fetchPRChecks,
-  fetchPRComments,
-  fetchPRDetail,
-  fetchPRFiles,
-  fetchPRIssueComments,
-  fetchPRReviews,
-  mergePR,
-} from "./github-api";
+import { createIssueComment, mergePR } from "./github-api";
+import { getPRBundle, invalidatePR } from "./pr-cache";
+import type { PRBundle } from "./pr-cache";
 import type {
   PRCheckRun,
   PRDetail,
@@ -122,20 +115,39 @@ export class PRDetailPanel {
     await this.refresh();
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(force = false): Promise<void> {
     const { submodule, prNumber } = this.state;
-    try {
-      const [detail, reviews, comments, files, lineComments] = await Promise.all([
-        fetchPRDetail(submodule.owner, submodule.repo, prNumber),
-        fetchPRReviews(submodule.owner, submodule.repo, prNumber),
-        fetchPRIssueComments(submodule.owner, submodule.repo, prNumber),
-        fetchPRFiles(submodule.owner, submodule.repo, prNumber),
-        fetchPRComments(submodule.owner, submodule.repo, prNumber),
-      ]);
-      const checks = await fetchPRChecks(submodule.owner, submodule.repo, detail.headSha);
-      this.state = { submodule, prNumber, detail, reviews, comments, lineComments, files, checks };
+
+    // Apply a bundle to the panel only if it's still showing the same PR.
+    const apply = (b: PRBundle): void => {
+      if (this.state.submodule.name !== submodule.name || this.state.prNumber !== prNumber) {
+        return;
+      }
+      this.state = {
+        submodule,
+        prNumber,
+        detail: b.detail,
+        reviews: b.reviews,
+        comments: b.comments,
+        lineComments: b.lineComments,
+        files: b.files,
+        checks: b.checks,
+      };
       this.postState();
+    };
+
+    try {
+      // Cache hit paints instantly; a stale entry triggers the onUpdate repaint.
+      const bundle = await getPRBundle(
+        submodule.owner,
+        submodule.repo,
+        prNumber,
+        { force },
+        apply,
+      );
+      apply(bundle);
     } catch (err) {
+      if (this.state.detail) return; // keep showing cached data on a failed revalidate
       const msg = err instanceof Error ? err.message : String(err);
       void this.panel.webview.postMessage({ type: "error", message: msg });
     }
@@ -147,7 +159,8 @@ export class PRDetailPanel {
         if (this.state.detail) this.postState();
         return;
       case "refresh":
-        await this.refresh();
+        invalidatePR(this.state.submodule.owner, this.state.submodule.repo, this.state.prNumber);
+        await this.refresh(true);
         return;
       case "openExternal":
         await vscode.env.openExternal(vscode.Uri.parse(msg.url));
@@ -164,7 +177,8 @@ export class PRDetailPanel {
           this.state.prNumber,
           msg.event,
         );
-        await this.refresh();
+        invalidatePR(this.state.submodule.owner, this.state.submodule.repo, this.state.prNumber);
+        await this.refresh(true);
         return;
       case "merge":
         await this.handleMerge(msg.method);
@@ -183,7 +197,8 @@ export class PRDetailPanel {
         trimmed,
       );
       void vscode.window.showInformationMessage("Hareer: Comment posted.");
-      await this.refresh();
+      invalidatePR(this.state.submodule.owner, this.state.submodule.repo, this.state.prNumber);
+      await this.refresh(true);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Hareer: Failed to post comment — ${msg}`);
@@ -204,7 +219,8 @@ export class PRDetailPanel {
       void vscode.window.showInformationMessage(
         `Hareer: PR #${prNumber} merged into ${detail.baseRef} ✓`,
       );
-      await this.refresh();
+      invalidatePR(submodule.owner, submodule.repo, prNumber);
+      await this.refresh(true);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Hareer: Failed to merge — ${msg}`);

@@ -20,9 +20,15 @@ import {
   switchClickUpWorkspace,
 } from "./task-manager/commands";
 import { TaskDetailPanel } from "./task-manager/task-detail-webview";
+import { PersistentCache } from "./cache";
+import { clearAllPRCache, configurePRCache } from "./code-review/pr-cache";
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   let makefileRootUri: vscode.Uri | undefined;
+
+  // Persistent stale-while-revalidate cache shared by tasks, PRs, and branches.
+  const cache = new PersistentCache(context.workspaceState, "hareer.cache");
+  configurePRCache(cache);
 
   const makefileProvider = new HareerTreeProvider();
   const makefileTreeView = vscode.window.createTreeView("hareerMakeTargets", {
@@ -166,7 +172,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   await loadSubmodules();
 
-  const taskService = new TaskService(context);
+  const taskService = new TaskService(context, cache);
   const taskTreeProvider = new TaskTreeProvider(taskService);
   const taskTreeView = vscode.window.createTreeView("hareerTaskManager", {
     treeDataProvider: taskTreeProvider,
@@ -200,6 +206,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     vscode.commands.registerCommand("hareer.refreshCodeReview", async () => {
       invalidateToken();
+      clearAllPRCache();
       await loadSubmodules();
       codeReviewProvider.refresh();
     }),
@@ -387,12 +394,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     vscode.commands.registerCommand("hareer.refreshTasks", async () => {
-      await taskService.refresh();
+      await taskService.refresh(true);
     }),
 
     vscode.commands.registerCommand("hareer.openTaskDetail", async (taskId: unknown) => {
       if (typeof taskId !== "string" || taskId.length === 0) return;
-      await TaskDetailPanel.openOrReveal(context, taskService, taskId);
+      await TaskDetailPanel.openOrReveal(context, taskService, cache, taskId);
     }),
 
     vscode.workspace.onDidChangeWorkspaceFolders(() => {

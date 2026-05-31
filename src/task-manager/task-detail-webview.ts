@@ -36,7 +36,8 @@ import { getTask, setCustomFieldValue, updateTaskStatus } from "./clickup-api";
 import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
-import { fetchOpenPRs } from "../code-review/github-api";
+import { getOpenPRs, invalidatePR } from "../code-review/pr-cache";
+import { PersistentCache, swr, TTL } from "../cache";
 import { execFile } from "node:child_process";
 import type { TaskService } from "./task-service";
 import type { BranchType, ClickUpTask, CommitType } from "./types";
@@ -111,6 +112,7 @@ export class TaskDetailPanel {
   static async openOrReveal(
     context: vscode.ExtensionContext,
     service: TaskService,
+    cache: PersistentCache,
     taskId: string,
   ): Promise<void> {
     if (TaskDetailPanel.current) {
@@ -127,7 +129,7 @@ export class TaskDetailPanel {
         localResourceRoots: [],
       },
     );
-    TaskDetailPanel.current = new TaskDetailPanel(context, service, panel);
+    TaskDetailPanel.current = new TaskDetailPanel(context, service, cache, panel);
     await TaskDetailPanel.current.show(taskId);
   }
 
@@ -137,6 +139,7 @@ export class TaskDetailPanel {
   private constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly service: TaskService,
+    private readonly cache: PersistentCache,
     private readonly panel: vscode.WebviewPanel,
   ) {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -182,6 +185,11 @@ export class TaskDetailPanel {
     }
   }
 
+  /** A new branch may now match the task id — drop cached branch lookups. */
+  private invalidateBranchCache(): void {
+    this.cache.deleteByPrefix("branch.");
+  }
+
   private async discoverContext(): Promise<void> {
     if (!this.state) return;
     const taskKey = (this.state.task.customId ?? this.state.task.id).trim();
@@ -195,10 +203,15 @@ export class TaskDetailPanel {
       repo: r.repo,
     }));
 
-    // Branch discovery — parallel across repos.
+    // Branch discovery — parallel across repos, served from cache (revalidated).
     const branchResults = await Promise.all(
       repos.map(async (r) => {
-        const branch = await findTaskBranch(r.absPath, taskKey);
+        const branch = await swr(
+          this.cache,
+          `branch.${r.absPath}.${taskKey}`,
+          () => findTaskBranch(r.absPath, taskKey),
+          { ttlMs: TTL.branches },
+        );
         return branch ? { repoPath: r.path, repoName: r.name, absPath: r.absPath, branch } : null;
       }),
     );
@@ -211,7 +224,7 @@ export class TaskDetailPanel {
         .filter((r): r is WorkspaceRepo & { owner: string; repo: string } => Boolean(r.owner && r.repo))
         .map(async (r) => {
           try {
-            const prs = await fetchOpenPRs(r.owner, r.repo);
+            const prs = await getOpenPRs(r.owner, r.repo);
             return prs
               .filter((p) => p.headRef.toLowerCase().includes(taskKey.toLowerCase()))
               .map<PRMatch>((p) => ({
@@ -330,6 +343,7 @@ export class TaskDetailPanel {
             );
           }
           await this.maybeAutoTransition("in progress");
+          this.invalidateBranchCache();
           void this.discoverContext();
         },
       );
@@ -351,6 +365,7 @@ export class TaskDetailPanel {
           void vscode.window.showInformationMessage(`Hareer: Checked out ${branchName}`);
           this.postFlash(`On branch ${branchName}`);
           await this.maybeAutoTransition("in progress");
+          this.invalidateBranchCache();
           void this.discoverContext();
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -768,9 +783,9 @@ export class TaskDetailPanel {
               }
             }
 
-            // Skip if an open PR already exists for this head.
+            // Skip if an open PR already exists for this head (force a fresh read).
             try {
-              const prs = await fetchOpenPRs(target.owner, target.repo);
+              const prs = await getOpenPRs(target.owner, target.repo, { force: true });
               const existing = prs.find((p) => p.headRef === branch);
               if (existing) {
                 skipped.push(`${target.name} (PR #${existing.number} already open)`);
@@ -804,6 +819,10 @@ export class TaskDetailPanel {
           void vscode.window.showWarningMessage(
             `Hareer: PR creation failed — ${errors.join("; ")}`,
           );
+        }
+        // New PRs exist now — drop the cached open-PR lists so discovery refetches.
+        for (const c of created) {
+          if (c.repo.owner && c.repo.repo) invalidatePR(c.repo.owner, c.repo.repo);
         }
         void this.discoverContext();
       },
