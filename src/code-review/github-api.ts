@@ -20,6 +20,8 @@ const BASE_URL = "api.github.com";
 
 let cachedToken: string | undefined;
 
+const fileContentCache = new Map<string, string>();
+
 async function getToken(): Promise<string> {
   if (cachedToken) return cachedToken;
   const session = await vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_SCOPES, {
@@ -33,10 +35,6 @@ export function invalidateToken(): void {
   cachedToken = undefined;
 }
 
-/**
- * Force a fresh GitHub sign-in dialog. Use this when the cached session was
- * granted with insufficient scopes (e.g. no access to private repos).
- */
 export async function reconnectGitHub(): Promise<void> {
   cachedToken = undefined;
   const session = await vscode.authentication.getSession(
@@ -309,6 +307,10 @@ export async function fetchFileContent(
   filePath: string,
   ref: string,
 ): Promise<string> {
+  const cacheKey = `${owner}/${repo}/${ref}/${filePath}`;
+  const cached = fileContentCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const token = await getToken();
   const encodedPath = encodeURIComponent(filePath).replace(/%2F/g, "/");
   const encodedRef = encodeURIComponent(ref);
@@ -318,10 +320,13 @@ export async function fetchFileContent(
       `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodedRef}`,
       token,
     );
-    if (raw.encoding === "base64") {
-      return Buffer.from(raw.content.replace(/\n/g, ""), "base64").toString("utf-8");
-    }
-    return raw.content;
+    const content =
+      raw.encoding === "base64"
+        ? Buffer.from(raw.content.replace(/\n/g, ""), "base64").toString("utf-8")
+        : raw.content;
+
+    fileContentCache.set(cacheKey, content);
+    return content;
   } catch {
     return "";
   }

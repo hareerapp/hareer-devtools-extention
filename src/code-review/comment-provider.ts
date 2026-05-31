@@ -82,27 +82,7 @@ export class HareerCommentProvider implements vscode.Disposable {
       for (const t of existing.threads) t.dispose();
     }
 
-    let prFilePatch: string | undefined;
-    try {
-      const prFiles = await fetchPRFiles(submodule.owner, submodule.repo, pr.number);
-      prFilePatch = prFiles.find((f) => f.filename === file.filename)?.patch;
-    } catch {
-      /* comment ranges stay empty */
-    }
-
-    let headLineCount = 0;
-    try {
-      const doc = await vscode.workspace.openTextDocument(headFileUri);
-      headLineCount = doc.lineCount;
-    } catch {
-      /* ignore */
-    }
-
-    const commentableRightLines = commentableRightLinesForFile(
-      prFilePatch,
-      file.status,
-      headLineCount,
-    );
+    const commentableRightLines = commentableRightLinesForFile(file.patch, file.status, 0);
 
     const ctx: ActiveDiffContext = {
       submodule,
@@ -116,7 +96,30 @@ export class HareerCommentProvider implements vscode.Disposable {
     };
     this.activeDiffs.set(key, ctx);
 
-    if (commentableRightLines.size === 0 && file.status !== "removed") {
+    // Fetch comments and finalize commentable ranges off the critical path so
+    // the diff renders instantly.
+    void this.hydrateServerThreads(key, ctx);
+  }
+
+  /** Background work for {@link loadCommentsForFile}: ranges fixup + threads. */
+  private async hydrateServerThreads(key: string, ctx: ActiveDiffContext): Promise<void> {
+    const { submodule, pr, file, headFileUri } = ctx;
+
+    // Added files sometimes ship without a patch from GitHub; derive the
+    // commentable lines from the head document's line count instead.
+    if (!file.patch && file.status === "added") {
+      try {
+        const doc = await vscode.workspace.openTextDocument(headFileUri);
+        if (this.activeDiffs.get(key) !== ctx) return; // superseded
+        ctx.commentableRightLines = new Set(
+          Array.from({ length: doc.lineCount }, (_, i) => i + 1),
+        );
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if (ctx.commentableRightLines.size === 0 && file.status !== "removed") {
       void vscode.window.showWarningMessage(
         `Hareer: Could not load diff hunks for ${file.filename}. Inline comments may fail — try re-opening the file or comment from github.com.`,
       );
@@ -128,6 +131,9 @@ export class HareerCommentProvider implements vscode.Disposable {
     } catch {
       return;
     }
+
+    // A newer file diff may have superseded this one while we were fetching.
+    if (this.activeDiffs.get(key) !== ctx) return;
 
     // Group comments into threads: replies attach to their root.
     const fileComments = comments.filter((c) => c.path === file.filename);
