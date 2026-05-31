@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { createIssueComment, mergePR } from "./github-api";
+import { createIssueComment, deleteBranch, isProtectedBranch, mergePR } from "./github-api";
 import { getPRBundle, invalidatePR } from "./pr-cache";
 import type { PRBundle } from "./pr-cache";
 import type {
@@ -216,8 +216,19 @@ export class PRDetailPanel {
     if (confirmed !== "Merge") return;
     try {
       await mergePR(submodule.owner, submodule.repo, prNumber, method);
+
+      let deletedNote = "";
+      if (!isProtectedBranch(detail.headRef, detail.baseRef)) {
+        try {
+          await deleteBranch(submodule.owner, submodule.repo, detail.headRef);
+          deletedNote = ` — deleted ${detail.headRef}`;
+        } catch {
+          /* branch may already be gone (auto-delete) — ignore */
+        }
+      }
+
       void vscode.window.showInformationMessage(
-        `Hareer: PR #${prNumber} merged into ${detail.baseRef} ✓`,
+        `Hareer: PR #${prNumber} merged into ${detail.baseRef} ✓${deletedNote}`,
       );
       invalidatePR(submodule.owner, submodule.repo, prNumber);
       await this.refresh(true);

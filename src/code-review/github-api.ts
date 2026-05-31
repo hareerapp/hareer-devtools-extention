@@ -696,3 +696,34 @@ export async function mergePR(
     { merge_method: mergeMethod },
   );
 }
+
+/** Delete a branch (its ref) on GitHub — used to clean up a PR head after merge. */
+export async function deleteBranch(
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<void> {
+  const token = await getToken();
+  const encoded = encodeURIComponent(branch).replace(/%2F/g, "/");
+  await githubRequest<unknown>(
+    "DELETE",
+    `/repos/${owner}/${repo}/git/refs/heads/${encoded}`,
+    token,
+  );
+}
+
+const CONVENTIONAL_BASE_BRANCHES = ["develop", "staging", "main", "master"];
+
+
+export function isProtectedBranch(branch: string, baseRef?: string): boolean {
+  const name = branch.trim().toLowerCase();
+  if (name.length === 0) return true;
+  if (baseRef && name === baseRef.trim().toLowerCase()) return true;
+  const configured = vscode.workspace
+    .getConfiguration("hareer.git")
+    .get<string[]>("baseBranches", ["develop", "staging", "main"]);
+  const protectedNames = new Set(
+    [...CONVENTIONAL_BASE_BRANCHES, ...configured].map((b) => b.toLowerCase()),
+  );
+  return protectedNames.has(name);
+}

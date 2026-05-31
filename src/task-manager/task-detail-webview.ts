@@ -37,6 +37,7 @@ import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
 import { getOpenPRs, invalidatePR } from "../code-review/pr-cache";
+import { deleteBranch, isProtectedBranch, mergePR } from "../code-review/github-api";
 import { PersistentCache, swr, TTL } from "../cache";
 import { execFile } from "node:child_process";
 import type { TaskService } from "./task-service";
@@ -58,6 +59,7 @@ type InboundMessage =
   | { type: "generateCommit"; stageAll: boolean }
   | { type: "push" }
   | { type: "createPRs"; baseRef: string }
+  | { type: "mergeTaskPRs" }
   | { type: "promptLinkPR" };
 
 interface RepoInfo {
@@ -84,6 +86,7 @@ interface PRMatch {
   readonly repo: string;
   readonly prNumber: number;
   readonly headRef: string;
+  readonly baseRef: string;
   readonly title: string;
   readonly url: string;
 }
@@ -235,6 +238,7 @@ export class TaskDetailPanel {
                 repo: r.repo,
                 prNumber: p.number,
                 headRef: p.headRef,
+                baseRef: p.baseRef,
                 title: p.title,
                 url: p.url,
               }));
@@ -270,6 +274,9 @@ export class TaskDetailPanel {
         return;
       case "openTaskReview":
         await this.handleOpenTaskReview();
+        return;
+      case "mergeTaskPRs":
+        await this.handleMergeTaskPRs();
         return;
       case "commit":
         await this.handleCommit(msg);
@@ -464,6 +471,87 @@ export class TaskDetailPanel {
     }
     if (!picked.pr) return;
     await this.showPRInCodeReview(picked.pr);
+  }
+
+  private async handleMergeTaskPRs(): Promise<void> {
+    if (!this.state) return;
+    const prs = this.state.prMatches;
+    if (prs.length === 0) {
+      void vscode.window.showWarningMessage(
+        "Hareer: No open PR found whose branch contains this task ID.",
+      );
+      return;
+    }
+
+    const methodItems: (vscode.QuickPickItem & { method: "merge" | "squash" | "rebase" })[] = [
+      { label: "$(git-merge) Merge commit", description: "Create a merge commit", method: "merge" },
+      { label: "$(squash) Squash and merge", description: "Squash all commits into one", method: "squash" },
+      { label: "$(arrow-up) Rebase and merge", description: "Rebase commits onto base branch", method: "rebase" },
+    ];
+    const pickedMethod = await vscode.window.showQuickPick(methodItems, {
+      placeHolder: `Merge ${prs.length} PR${prs.length === 1 ? "" : "s"} for this task`,
+    });
+    if (!pickedMethod) return;
+    const method = pickedMethod.method;
+
+    const confirmed = await vscode.window.showWarningMessage(
+      `Merge ${prs.length} PR${prs.length === 1 ? "" : "s"} for this task, delete the merged branch${prs.length === 1 ? "" : "es"}, and mark the task "ready to deploy"?`,
+      { modal: true },
+      "Merge",
+    );
+    if (confirmed !== "Merge") return;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Merging ${prs.length} PR${prs.length === 1 ? "" : "s"}…`,
+        cancellable: false,
+      },
+      async () => {
+        const merged: string[] = [];
+        const failed: string[] = [];
+
+        for (const pr of prs) {
+          try {
+            await mergePR(pr.owner, pr.repo, pr.prNumber, method);
+            let note = `${pr.repoName} #${pr.prNumber}`;
+            if (!isProtectedBranch(pr.headRef, pr.baseRef)) {
+              try {
+                await deleteBranch(pr.owner, pr.repo, pr.headRef);
+                note += ` (deleted ${pr.headRef})`;
+              } catch {
+                /* branch may already be gone — ignore */
+              }
+            }
+            invalidatePR(pr.owner, pr.repo, pr.prNumber);
+            merged.push(note);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            failed.push(`${pr.repoName} #${pr.prNumber}: ${msg}`);
+          }
+        }
+
+        if (merged.length > 0) {
+          this.postFlash(`Merged ${merged.length} PR${merged.length === 1 ? "" : "s"}.`);
+          void vscode.window.showInformationMessage(
+            `Hareer: Merged ${merged.length} PR${merged.length === 1 ? "" : "s"} — ${merged.join(", ")}.`,
+          );
+        }
+        if (failed.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: ${failed.length} PR${failed.length === 1 ? "" : "s"} could not be merged — ${failed.join("; ")}`,
+          );
+        }
+
+        // Only advance the task when every matched PR merged cleanly.
+        if (failed.length === 0 && merged.length > 0) {
+          await this.maybeAutoTransition("ready to deploy");
+        }
+
+        void this.discoverContext();
+        void this.service.refresh();
+      },
+    );
   }
 
   /** Route a matched PR into the Code Review tree (no standalone detail panel). */
@@ -1781,6 +1869,11 @@ function render() {
         '👁 Code Review <span class="count">' + prCount + '</span>' +
       '</button>',
     );
+    actionBtns.push(
+      '<button class="action-btn" id="action-merge-prs" title="Merge ' + prCount + ' PR' + (prCount === 1 ? '' : 's') + ', delete merged branches, and mark ready to deploy">' +
+        '⤭ Merge' + (prCount > 1 ? ' <span class="count">' + prCount + '</span>' : '') +
+      '</button>',
+    );
   }
   actionBtns.push('<button class="action-btn" id="action-commit">Commit</button>');
   actionBtns.push(
@@ -2027,6 +2120,8 @@ function bindEvents() {
   });
   const actionReview = document.getElementById("action-review");
   if (actionReview) actionReview.addEventListener("click", () => vscode.postMessage({ type: "openTaskReview" }));
+  const actionMergePRs = document.getElementById("action-merge-prs");
+  if (actionMergePRs) actionMergePRs.addEventListener("click", () => vscode.postMessage({ type: "mergeTaskPRs" }));
   const actionCommit = document.getElementById("action-commit");
   if (actionCommit) actionCommit.addEventListener("click", () => {
     savedState.showCommitSection = true;
