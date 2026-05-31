@@ -58,7 +58,7 @@ type InboundMessage =
   | { type: "generateCommit"; stageAll: boolean }
   | { type: "push" }
   | { type: "createPRs"; baseRef: string }
-  | { type: "linkPR"; url: string };
+  | { type: "promptLinkPR" };
 
 interface RepoInfo {
   readonly name: string;
@@ -283,8 +283,8 @@ export class TaskDetailPanel {
       case "createPRs":
         await this.handleCreatePRs(msg.baseRef);
         return;
-      case "linkPR":
-        await this.handleLinkPR(msg.url);
+      case "promptLinkPR":
+        await this.promptLinkPR();
         return;
     }
   }
@@ -1025,6 +1025,27 @@ export class TaskDetailPanel {
       });
       if (url) await this.handleLinkPR(url.trim());
     }
+  }
+
+  /** Show a native input box to capture a PR URL, then link it (webview prompt() is disabled). */
+  private async promptLinkPR(): Promise<void> {
+    if (!this.state) return;
+    const fieldName = vscode.workspace
+      .getConfiguration("hareer.clickup")
+      .get<string>("prUrlFieldName", "Github PR Url");
+    const current = getLinkedPR(this.state.task, fieldName)?.url ?? "";
+    const url = await vscode.window.showInputBox({
+      prompt: "Paste the GitHub PR URL to link to this ClickUp task",
+      placeHolder: "https://github.com/owner/repo/pull/123",
+      value: current,
+      ignoreFocusOut: true,
+      validateInput: (v) =>
+        /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(v.trim())
+          ? undefined
+          : "Must be a GitHub PR URL",
+    });
+    if (!url) return;
+    await this.handleLinkPR(url.trim());
   }
 
   private async handleLinkPR(url: string): Promise<void> {
@@ -2014,9 +2035,8 @@ function bindEvents() {
   });
   const actionLinkPR = document.getElementById("action-link-pr");
   if (actionLinkPR) actionLinkPR.addEventListener("click", () => {
-    const current = model && model.linkedPR ? model.linkedPR.url : "";
-    const url = prompt("Paste GitHub PR URL", current);
-    if (url) vscode.postMessage({ type: "linkPR", url: url.trim() });
+    // prompt() is disabled in VS Code webviews — let the host show a native input box.
+    vscode.postMessage({ type: "promptLinkPR" });
   });
 
   // Repo multi-select pills
