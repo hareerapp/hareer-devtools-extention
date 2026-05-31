@@ -50,6 +50,16 @@ export class TaskService {
     }
   }
 
+  /** Every task currently in memory — mine plus any loaded teammates' tasks. */
+  getAllKnownTasks(): ClickUpTask[] {
+    const out: ClickUpTask[] = [];
+    if (this.snapshot) out.push(...this.snapshot.myTasks);
+    for (const tc of this.teammateCache.values()) {
+      if (tc.tasks) out.push(...tc.tasks);
+    }
+    return out;
+  }
+
   getTeammates(): readonly ClickUpUser[] {
     const snap = this.snapshot;
     if (!snap) return [];

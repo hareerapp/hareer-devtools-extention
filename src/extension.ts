@@ -20,6 +20,7 @@ import {
   switchClickUpWorkspace,
 } from "./task-manager/commands";
 import { TaskDetailPanel } from "./task-manager/task-detail-webview";
+import { transitionTaskForReview } from "./task-manager/review-transition";
 import { PersistentCache } from "./cache";
 import { clearAllPRCache, configurePRCache } from "./code-review/pr-cache";
 
@@ -173,6 +174,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await loadSubmodules();
 
   const taskService = new TaskService(context, cache);
+
+  // When a reviewer requests changes or leaves a comment review, bounce the
+  // linked ClickUp task back to "in progress" (gated by hareer.clickup.autoTransition).
+  commentProvider.setOnReviewSubmitted((submodule, pr, event) => {
+    if (event !== "REQUEST_CHANGES" && event !== "COMMENT") return;
+    void transitionTaskForReview(
+      context,
+      taskService,
+      { owner: submodule.owner, repo: submodule.repo, number: pr.number, headRef: pr.headRef },
+      "in progress",
+    );
+  });
+
   const taskTreeProvider = new TaskTreeProvider(taskService);
   const taskTreeView = vscode.window.createTreeView("hareerTaskManager", {
     treeDataProvider: taskTreeProvider,

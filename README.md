@@ -69,7 +69,7 @@ When a task **has a linked PR**:
 | Setting | Default | Purpose |
 |---|---|---|
 | `hareer.clickup.prUrlFieldName` | `Github PR Url` | Name of the ClickUp custom field that holds the PR URL |
-| `hareer.clickup.autoTransition` | `false` | When `true`: move task to "in progress" on branch creation, "in review" when PR is linked |
+| `hareer.clickup.autoTransition` | `true` | When `true`: move task to "in progress" on branch creation, "in review" when PR is linked, and back to "in progress" when a reviewer requests changes or leaves a comment review |
 | `hareer.clickup.branchTypes` | `[feature, bugfix, hotfix, chore, docs, refactor]` | Branch type chips shown in the panel |
 | `hareer.clickup.pollIntervalMs` | `0` | Auto-refresh interval (ms). 0 disables polling |
 

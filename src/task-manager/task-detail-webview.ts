@@ -1057,7 +1057,7 @@ export class TaskDetailPanel {
     if (!this.state) return;
     const auto = vscode.workspace
       .getConfiguration("hareer.clickup")
-      .get<boolean>("autoTransition", false);
+      .get<boolean>("autoTransition", true);
     if (!auto) return;
     if (this.state.task.status.status.toLowerCase() === targetStatus.toLowerCase()) return;
     const token = await getClickUpToken(this.context);

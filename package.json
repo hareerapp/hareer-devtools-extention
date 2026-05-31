@@ -233,8 +233,8 @@
         },
         "hareer.clickup.autoTransition": {
           "type": "boolean",
-          "default": false,
-          "description": "Automatically move ClickUp tasks between statuses when you create branches and push."
+          "default": true,
+          "description": "Automatically move ClickUp tasks between statuses: to \"in progress\" when you create a branch, to \"in review\" when a PR is linked, and back to \"in progress\" when a reviewer requests changes or leaves a comment review."
         },
         "hareer.clickup.branchTypes": {
           "type": "array",

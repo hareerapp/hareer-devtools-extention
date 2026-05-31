@@ -47,6 +47,23 @@ export class HareerCommentProvider implements vscode.Disposable {
   private readonly _onDidChangePending = new vscode.EventEmitter<void>();
   readonly onDidChangePending = this._onDidChangePending.event;
 
+  private onReviewSubmitted: (
+    submodule: Submodule,
+    pr: PullRequest,
+    event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+  ) => void = () => {};
+
+  /** Notified after a review is successfully submitted (used to auto-transition tasks). */
+  setOnReviewSubmitted(
+    handler: (
+      submodule: Submodule,
+      pr: PullRequest,
+      event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+    ) => void,
+  ): void {
+    this.onReviewSubmitted = handler;
+  }
+
   readonly store = new PendingReviewStore();
 
   constructor() {
@@ -378,6 +395,8 @@ export class HareerCommentProvider implements vscode.Disposable {
       void vscode.window.showInformationMessage(
         `Hareer: Review submitted on PR #${pr.number} — ${eventVerb(event)} with ${pending?.comments.length ?? 0} comment(s).`,
       );
+
+      this.onReviewSubmitted(submodule, pr, event);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Hareer: Failed to submit review — ${msg}`);
