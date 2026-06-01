@@ -37,7 +37,7 @@ import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
 import { getOpenPRs, invalidatePR } from "../code-review/pr-cache";
-import { deleteBranch, isProtectedBranch, mergePR } from "../code-review/github-api";
+import { mergePR } from "../code-review/github-api";
 import { PersistentCache, swr, TTL } from "../cache";
 import { execFile } from "node:child_process";
 import type { TaskService } from "./task-service";
@@ -495,7 +495,7 @@ export class TaskDetailPanel {
     const method = pickedMethod.method;
 
     const confirmed = await vscode.window.showWarningMessage(
-      `Merge ${prs.length} PR${prs.length === 1 ? "" : "s"} for this task, delete the merged branch${prs.length === 1 ? "" : "es"}, and mark the task "ready to deploy"?`,
+      `Merge ${prs.length} PR${prs.length === 1 ? "" : "s"} for this task and mark it "ready to deploy"?`,
       { modal: true },
       "Merge",
     );
@@ -514,17 +514,8 @@ export class TaskDetailPanel {
         for (const pr of prs) {
           try {
             await mergePR(pr.owner, pr.repo, pr.prNumber, method);
-            let note = `${pr.repoName} #${pr.prNumber}`;
-            if (!isProtectedBranch(pr.headRef, pr.baseRef)) {
-              try {
-                await deleteBranch(pr.owner, pr.repo, pr.headRef);
-                note += ` (deleted ${pr.headRef})`;
-              } catch {
-                /* branch may already be gone — ignore */
-              }
-            }
             invalidatePR(pr.owner, pr.repo, pr.prNumber);
-            merged.push(note);
+            merged.push(`${pr.repoName} #${pr.prNumber}`);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             failed.push(`${pr.repoName} #${pr.prNumber}: ${msg}`);
@@ -1870,7 +1861,7 @@ function render() {
       '</button>',
     );
     actionBtns.push(
-      '<button class="action-btn" id="action-merge-prs" title="Merge ' + prCount + ' PR' + (prCount === 1 ? '' : 's') + ', delete merged branches, and mark ready to deploy">' +
+      '<button class="action-btn" id="action-merge-prs" title="Merge ' + prCount + ' PR' + (prCount === 1 ? '' : 's') + ' and mark ready to deploy">' +
         '⤭ Merge' + (prCount > 1 ? ' <span class="count">' + prCount + '</span>' : '') +
       '</button>',
     );

@@ -34,7 +34,8 @@ type InboundMessage =
   | { type: "openFile"; filename: string }
   | { type: "postComment"; body: string }
   | { type: "submitReview"; event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT" }
-  | { type: "merge"; method: "merge" | "squash" | "rebase" };
+  | { type: "merge"; method: "merge" | "squash" | "rebase" }
+  | { type: "deleteBranch" };
 
 export interface PRDetailHostCallbacks {
   openFile(submodule: Submodule, prNumber: number, filename: string): Promise<void>;
@@ -84,6 +85,8 @@ export class PRDetailPanel {
   }
 
   private state: PanelState;
+  /** Set once the user deletes the head branch from this panel, to hide the button. */
+  private branchDeleted = false;
   private readonly disposables: vscode.Disposable[] = [];
 
   private constructor(private readonly panel: vscode.WebviewPanel) {
@@ -109,6 +112,7 @@ export class PRDetailPanel {
 
   async show(submodule: Submodule, prNumber: number): Promise<void> {
     this.state = { submodule, prNumber };
+    this.branchDeleted = false;
     this.panel.title = `PR #${prNumber} · ${submodule.repo}`;
     this.panel.webview.html = this.render();
     this.panel.reveal(vscode.ViewColumn.Active, false);
@@ -183,6 +187,36 @@ export class PRDetailPanel {
       case "merge":
         await this.handleMerge(msg.method);
         return;
+      case "deleteBranch":
+        await this.handleDeleteBranch();
+        return;
+    }
+  }
+
+  private async handleDeleteBranch(): Promise<void> {
+    const { detail, submodule, prNumber } = this.state;
+    if (!detail) return;
+    if (isProtectedBranch(detail.headRef, detail.baseRef)) {
+      void vscode.window.showWarningMessage(
+        `Hareer: ${detail.headRef} is a base branch and won't be deleted.`,
+      );
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete branch ${detail.headRef}? This can't be undone from here (GitHub can restore it).`,
+      { modal: true },
+      "Delete branch",
+    );
+    if (confirmed !== "Delete branch") return;
+    try {
+      await deleteBranch(submodule.owner, submodule.repo, detail.headRef);
+      this.branchDeleted = true;
+      invalidatePR(submodule.owner, submodule.repo, prNumber);
+      void vscode.window.showInformationMessage(`Hareer: Deleted branch ${detail.headRef}.`);
+      this.postState();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Hareer: Could not delete ${detail.headRef} — ${msg}`);
     }
   }
 
@@ -216,19 +250,8 @@ export class PRDetailPanel {
     if (confirmed !== "Merge") return;
     try {
       await mergePR(submodule.owner, submodule.repo, prNumber, method);
-
-      let deletedNote = "";
-      if (!isProtectedBranch(detail.headRef, detail.baseRef)) {
-        try {
-          await deleteBranch(submodule.owner, submodule.repo, detail.headRef);
-          deletedNote = ` — deleted ${detail.headRef}`;
-        } catch {
-          /* branch may already be gone (auto-delete) — ignore */
-        }
-      }
-
       void vscode.window.showInformationMessage(
-        `Hareer: PR #${prNumber} merged into ${detail.baseRef} ✓${deletedNote}`,
+        `Hareer: PR #${prNumber} merged into ${detail.baseRef} ✓`,
       );
       invalidatePR(submodule.owner, submodule.repo, prNumber);
       await this.refresh(true);
@@ -249,6 +272,8 @@ export class PRDetailPanel {
       lineComments: lineComments ?? [],
       files: files ?? [],
       checks: checks ?? [],
+      canDeleteBranch:
+        detail.merged && !this.branchDeleted && !isProtectedBranch(detail.headRef, detail.baseRef),
     });
   }
 
@@ -885,6 +910,16 @@ function render() {
             '</div>' +
           '</div>'
         ) : '') +
+
+        (model.canDeleteBranch ? (
+          '<div class="merge-box">' +
+            '<div class="merge-title">Branch cleanup</div>' +
+            '<div class="merge-status">This PR is merged. You can delete the head branch <span class="branch-ref">' + escape(d.headRef) + '</span>.</div>' +
+            '<div class="merge-actions">' +
+              '<button class="danger" id="delete-branch">🗑 Delete branch</button>' +
+            '</div>' +
+          '</div>'
+        ) : '') +
       '</div>' +
 
       '<div class="sidebar">' +
@@ -946,6 +981,8 @@ function bindEvents() {
   document.querySelectorAll('[data-merge]').forEach((btn) => {
     btn.addEventListener('click', () => vscode.postMessage({ type: 'merge', method: btn.getAttribute('data-merge') }));
   });
+  const deleteBranchBtn = document.getElementById('delete-branch');
+  if (deleteBranchBtn) deleteBranchBtn.addEventListener('click', () => vscode.postMessage({ type: 'deleteBranch' }));
   const refresh = document.getElementById('refresh-btn');
   if (refresh) refresh.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
 

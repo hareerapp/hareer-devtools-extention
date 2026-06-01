@@ -2,7 +2,7 @@
   "name": "hareer-devtools",
   "displayName": "Hareer DevTools",
   "description": "ClickUp task manager, code review, and Makefile runner for the Hareer monorepo.",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "publisher": "Hareer-Team",
   "private": true,
   "repository": {
