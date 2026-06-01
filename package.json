@@ -2,7 +2,7 @@
   "name": "hareer-devtools",
   "displayName": "Hareer DevTools",
   "description": "ClickUp task manager, code review, and Makefile runner for the Hareer monorepo.",
-  "version": "0.4.0",
+  "version": "0.5.1",
   "publisher": "Hareer-Team",
   "private": true,
   "repository": {
@@ -117,6 +117,16 @@
       {
         "command": "hareer.openTaskDetail",
         "title": "Hareer: Open Task Detail"
+      },
+      {
+        "command": "hareer.filterTasks",
+        "title": "Hareer: Filter Tasks",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "hareer.clearTaskFilters",
+        "title": "Hareer: Clear Task Filters",
+        "icon": "$(clear-all)"
       }
     ],
     "viewsContainers": {
@@ -169,9 +179,19 @@
           "group": "navigation@1"
         },
         {
-          "command": "hareer.switchClickUpWorkspace",
+          "command": "hareer.filterTasks",
           "when": "view == hareerTaskManager && hareer.clickup.connected",
           "group": "navigation@2"
+        },
+        {
+          "command": "hareer.clearTaskFilters",
+          "when": "view == hareerTaskManager && hareer.clickup.connected && hareer.tasks.filtered",
+          "group": "navigation@3"
+        },
+        {
+          "command": "hareer.switchClickUpWorkspace",
+          "when": "view == hareerTaskManager && hareer.clickup.connected",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [

@@ -411,6 +411,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await taskService.refresh(true);
     }),
 
+    vscode.commands.registerCommand("hareer.filterTasks", async () => {
+      await pickTaskFilters(taskTreeProvider);
+    }),
+
+    vscode.commands.registerCommand("hareer.clearTaskFilters", () => {
+      taskTreeProvider.clearFilters();
+    }),
+
     vscode.commands.registerCommand("hareer.openTaskDetail", async (taskId: unknown) => {
       if (typeof taskId !== "string" || taskId.length === 0) return;
       await TaskDetailPanel.openOrReveal(context, taskService, cache, taskId);
@@ -432,4 +440,76 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export function deactivate(): void {
   disposeHareerTerminal();
   cleanupTempFiles();
+}
+
+interface FilterMenuItem extends vscode.QuickPickItem {
+  readonly key: "status" | "priority" | "tags" | "search" | "clear" | "done";
+}
+
+/**
+ * Interactive, ClickUp-style task filter editor. Loops a facet menu so the user
+ * can set Status / Priority / Tags / text Search, then applies them to the tree.
+ */
+async function pickTaskFilters(provider: TaskTreeProvider): Promise<void> {
+  const summary = (arr: string[]): string => (arr.length > 0 ? arr.join(", ") : "any");
+
+  for (;;) {
+    const f = provider.getFilters();
+    const facets = provider.getFacetOptions();
+    const menu = await vscode.window.showQuickPick<FilterMenuItem>(
+      [
+        { label: "$(check) Status", description: summary(f.statuses), key: "status" },
+        { label: "$(flame) Priority", description: summary(f.priorities), key: "priority" },
+        { label: "$(tag) Tags", description: summary(f.tags), key: "tags" },
+        { label: "$(search) Search text", description: f.search || "none", key: "search" },
+        { label: "$(clear-all) Clear all filters", key: "clear" },
+        { label: "$(check-all) Done", key: "done" },
+      ],
+      { placeHolder: "Filter tasks — choose a facet, then Done to apply" },
+    );
+
+    if (!menu || menu.key === "done") return;
+
+    if (menu.key === "clear") {
+      provider.clearFilters();
+      return;
+    }
+
+    if (menu.key === "search") {
+      const text = await vscode.window.showInputBox({
+        prompt: "Filter tasks by text (matches name or id)",
+        value: f.search,
+        placeHolder: "e.g. auth redirect",
+      });
+      if (text !== undefined) provider.setFilters({ ...provider.getFilters(), search: text });
+      continue;
+    }
+
+    const options =
+      menu.key === "status" ? facets.statuses : menu.key === "priority" ? facets.priorities : facets.tags;
+    if (options.length === 0) {
+      void vscode.window.showInformationMessage(
+        `Hareer: No ${menu.key} values available yet — open a teammate or refresh to load more tasks.`,
+      );
+      continue;
+    }
+
+    const current = new Set(
+      (menu.key === "status" ? f.statuses : menu.key === "priority" ? f.priorities : f.tags).map((v) =>
+        v.toLowerCase(),
+      ),
+    );
+    const picked = await vscode.window.showQuickPick(
+      options.map((o) => ({ label: o, picked: current.has(o.toLowerCase()) })),
+      { canPickMany: true, placeHolder: `Select ${menu.key} to include (none selected = all)` },
+    );
+    if (picked === undefined) continue;
+
+    const selected = picked.map((p) => p.label.toLowerCase());
+    const next = provider.getFilters();
+    if (menu.key === "status") next.statuses = selected;
+    else if (menu.key === "priority") next.priorities = selected;
+    else next.tags = selected;
+    provider.setFilters(next);
+  }
 }
