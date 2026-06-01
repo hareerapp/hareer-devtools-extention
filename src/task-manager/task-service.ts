@@ -156,8 +156,13 @@ export class TaskService {
       }
     }
 
-    // Only show the spinner on a true cold load; otherwise keep prior tasks shown.
-    this.loading = this.snapshot === undefined;
+    if (force) {
+      this.cache.deleteByPrefix("tasks.");
+      this.cache.deleteByPrefix("teammate.");
+      this.snapshot = undefined;
+    }
+
+    this.loading = force || this.snapshot === undefined;
     this.lastError = undefined;
     this.teammateCache.clear();
     this._onDidChange.fire();
