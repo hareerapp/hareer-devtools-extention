@@ -197,6 +197,7 @@ export async function fetchOpenPRs(owner: string, repo: string): Promise<PullReq
     number: pr.number,
     title: pr.title,
     state: "open",
+    merged: false,
     headSha: pr.head.sha,
     baseSha: pr.base.sha,
     headRef: pr.head.ref,
@@ -205,14 +206,26 @@ export async function fetchOpenPRs(owner: string, repo: string): Promise<PullReq
   }));
 }
 
+const PR_PAGE_SIZE = 100;
+/** Cap pagination so a large monorepo can't trigger an unbounded request fan-out. */
+const MAX_PR_PAGES = 10;
+
 export async function fetchAllPRs(owner: string, repo: string): Promise<PullRequest[]> {
   const token = await getToken();
-  const raw = await githubRequest<RawPR[]>(
-    "GET",
-    `/repos/${owner}/${repo}/pulls?state=all&per_page=100`,
-    token,
-  );
-  return raw.map((pr) => ({
+  // `state=all` can span thousands of PRs in an active repo; the GitHub list endpoint
+  // only returns one page at a time. Walk pages (newest first) until a short page signals
+  // the end, bounded by MAX_PR_PAGES so the discovery never fans out without limit.
+  const all: RawPR[] = [];
+  for (let page = 1; page <= MAX_PR_PAGES; page++) {
+    const raw = await githubRequest<RawPR[]>(
+      "GET",
+      `/repos/${owner}/${repo}/pulls?state=all&per_page=${PR_PAGE_SIZE}&page=${page}`,
+      token,
+    );
+    all.push(...raw);
+    if (raw.length < PR_PAGE_SIZE) break;
+  }
+  return all.map((pr) => ({
     number: pr.number,
     title: pr.title,
     state: pr.state === "open" ? "open" : "closed",
@@ -256,6 +269,7 @@ export async function fetchPRByNumber(
     number: pr.number,
     title: pr.title,
     state: pr.state === "open" ? "open" : "closed",
+    merged: Boolean(pr.merged_at),
     headSha: pr.head.sha,
     baseSha: pr.base.sha,
     headRef: pr.head.ref,

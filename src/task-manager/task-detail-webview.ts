@@ -95,6 +95,8 @@ interface PRMatch {
   readonly merged: boolean;
   readonly mergeable: boolean | null;
   readonly headBranchExists: boolean;
+  /** True when this is a merged, still-present, non-protected branch the user can delete. */
+  readonly deletable: boolean;
 }
 
 interface PanelState {
@@ -265,9 +267,11 @@ export class TaskDetailPanel {
                   title: p.title,
                   url: p.url,
                   state: p.state,
-                  merged: p.merged ?? false,
+                  merged: p.merged,
                   mergeable,
                   headBranchExists,
+                  deletable:
+                    p.merged && headBranchExists && !isProtectedBranch(p.headRef, p.baseRef),
                 };
               }),
             );
@@ -582,9 +586,7 @@ export class TaskDetailPanel {
 
   private async handleDeleteTaskBranches(): Promise<void> {
     if (!this.state) return;
-    const deletable = this.state.prMatches.filter(
-      (p) => p.merged && p.headBranchExists && !isProtectedBranch(p.headRef, p.baseRef),
-    );
+    const deletable = this.state.prMatches.filter((p) => p.deletable);
     if (deletable.length === 0) {
       void vscode.window.showInformationMessage("Hareer: No deletable branches found.");
       return;
@@ -992,7 +994,7 @@ export class TaskDetailPanel {
             // Skip if an open PR already exists for this head (force a fresh read).
             try {
               const prs = await getAllPRs(target.owner, target.repo, { force: true });
-              const existing = prs.find((p: { headRef: string; number: number; state: string }) => p.headRef === branch && p.state === "open");
+              const existing = prs.find((p) => p.headRef === branch && p.state === "open");
               if (existing) {
                 skipped.push(`${target.name} (PR #${existing.number} already open)`);
                 continue;
@@ -1383,6 +1385,7 @@ export class TaskDetailPanel {
         merged: p.merged,
         mergeable: p.mergeable,
         headBranchExists: p.headBranchExists,
+        deletable: p.deletable,
       })),
       cursorCommitGenerate: isCursorIDE(),
     });
@@ -1992,7 +1995,7 @@ function render() {
   const conflictedPRs = openPRs.filter((p) => p.mergeable === false);
   const openPRCount = openPRs.length;
   const allMerged = allPRs.length > 0 && openPRCount === 0 && mergedPRs.length > 0;
-  const deletableBranches = mergedPRs.filter((p) => p.headBranchExists);
+  const deletableBranches = allPRs.filter((p) => p.deletable);
   if (branchCount > 0) savedState.showBranchSection = false;
 
   const conflictBannerHtml = conflictedPRs.length > 0
