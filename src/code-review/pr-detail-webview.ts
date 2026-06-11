@@ -127,6 +127,10 @@ export class PRDetailPanel {
       let headBranchExists = true;
       if (b.detail.merged) {
         headBranchExists = await branchExists(submodule.owner, submodule.repo, b.detail.headRef).catch(() => true);
+        // Re-check after the awaited request: the user may have switched PRs while it was in flight.
+        if (this.state.submodule.name !== submodule.name || this.state.prNumber !== prNumber) {
+          return;
+        }
       }
       this.state = {
         submodule,
