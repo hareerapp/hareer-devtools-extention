@@ -324,7 +324,8 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
           item.description =
             pendingCount > 0 ? `${baseDesc}  ·  ${pendingCount} pending` : baseDesc;
           item.tooltip = selectedPR.url;
-          item.contextValue = pendingCount > 0 ? "prSelectorActivePending" : "prSelectorActive";
+          const prStateSuffix = selectedPR.state === "open" ? "Open" : "Closed";
+          item.contextValue = pendingCount > 0 ? `prSelectorActivePending${prStateSuffix}` : `prSelectorActive${prStateSuffix}`;
           item.command = {
             command: "hareer.openPRDetail",
             title: "Open Pull Request",

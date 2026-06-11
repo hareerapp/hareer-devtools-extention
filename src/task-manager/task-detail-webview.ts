@@ -32,16 +32,16 @@ import {
   isCursorIDE,
 } from "./cursor-commit-generator";
 import { findPRField, getLinkedPR } from "./pr-url-field";
-import { getTask, setCustomFieldValue, updateTaskStatus } from "./clickup-api";
+import { getListStatuses, getTask, setCustomFieldValue, updateTaskStatus } from "./clickup-api";
 import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
-import { getOpenPRs, invalidatePR } from "../code-review/pr-cache";
-import { mergePR } from "../code-review/github-api";
+import { getAllPRs, getCachedPRDetail, invalidatePR } from "../code-review/pr-cache";
+import { branchExists, deleteBranch, isProtectedBranch, mergePR } from "../code-review/github-api";
 import { PersistentCache, swr, TTL } from "../cache";
 import { execFile } from "node:child_process";
 import type { TaskService } from "./task-service";
-import type { BranchType, ClickUpTask, CommitType } from "./types";
+import type { BranchType, ClickUpStatus, ClickUpTask, CommitType } from "./types";
 
 // ============================================================================
 // Types
@@ -60,6 +60,8 @@ type InboundMessage =
   | { type: "push" }
   | { type: "createPRs"; baseRef: string }
   | { type: "mergeTaskPRs" }
+  | { type: "deleteTaskBranches" }
+  | { type: "changeStatus" }
   | { type: "promptLinkPR" };
 
 interface RepoInfo {
@@ -89,6 +91,10 @@ interface PRMatch {
   readonly baseRef: string;
   readonly title: string;
   readonly url: string;
+  readonly state: "open" | "closed";
+  readonly merged: boolean;
+  readonly mergeable: boolean | null;
+  readonly headBranchExists: boolean;
 }
 
 interface PanelState {
@@ -162,7 +168,7 @@ export class TaskDetailPanel {
     );
   }
 
-  async show(taskId: string): Promise<void> {
+  async show(taskId: string, force = false): Promise<void> {
     const token = await getClickUpToken(this.context);
     if (!token) {
       void vscode.window.showWarningMessage("Hareer: Connect ClickUp first.");
@@ -173,6 +179,11 @@ export class TaskDetailPanel {
     if (!this.state || this.state.taskId !== taskId) {
       this.panel.webview.html = this.render();
       this.panel.reveal(vscode.ViewColumn.Active, false);
+    }
+    if (force) {
+      this.cache.deleteByPrefix("branch.");
+      this.cache.deleteByPrefix("allPRs.");
+      this.cache.deleteByPrefix("prDetail.");
     }
     try {
       const task = await getTask(token, taskId);
@@ -227,21 +238,39 @@ export class TaskDetailPanel {
         .filter((r): r is WorkspaceRepo & { owner: string; repo: string } => Boolean(r.owner && r.repo))
         .map(async (r) => {
           try {
-            const prs = await getOpenPRs(r.owner, r.repo);
-            return prs
-              .filter((p) => p.headRef.toLowerCase().includes(taskKey.toLowerCase()))
-              .map<PRMatch>((p) => ({
-                repoPath: r.path,
-                repoName: r.name,
-                absPath: r.absPath,
-                owner: r.owner,
-                repo: r.repo,
-                prNumber: p.number,
-                headRef: p.headRef,
-                baseRef: p.baseRef,
-                title: p.title,
-                url: p.url,
-              }));
+            const prs = await getAllPRs(r.owner, r.repo);
+            const matches = prs.filter((p) => p.headRef.toLowerCase().includes(taskKey.toLowerCase()));
+            return Promise.all(
+              matches.map(async (p): Promise<PRMatch> => {
+                let mergeable: boolean | null = null;
+                let headBranchExists = true;
+                try {
+                  const detail = await getCachedPRDetail(r.owner, r.repo, p.number);
+                  mergeable = detail.mergeable;
+                } catch {
+                  // detail unavailable — mergeable stays null
+                }
+                if (p.merged) {
+                  headBranchExists = await branchExists(r.owner, r.repo, p.headRef).catch(() => true);
+                }
+                return {
+                  repoPath: r.path,
+                  repoName: r.name,
+                  absPath: r.absPath,
+                  owner: r.owner,
+                  repo: r.repo,
+                  prNumber: p.number,
+                  headRef: p.headRef,
+                  baseRef: p.baseRef,
+                  title: p.title,
+                  url: p.url,
+                  state: p.state,
+                  merged: p.merged ?? false,
+                  mergeable,
+                  headBranchExists,
+                };
+              }),
+            );
           } catch {
             return [];
           }
@@ -258,7 +287,7 @@ export class TaskDetailPanel {
         if (this.state) this.postState();
         return;
       case "refresh":
-        await this.show(this.state.taskId);
+        await this.show(this.state.taskId, true);
         return;
       case "openExternal":
         await vscode.env.openExternal(vscode.Uri.parse(msg.url));
@@ -277,6 +306,12 @@ export class TaskDetailPanel {
         return;
       case "mergeTaskPRs":
         await this.handleMergeTaskPRs();
+        return;
+      case "deleteTaskBranches":
+        await this.handleDeleteTaskBranches();
+        return;
+      case "changeStatus":
+        await this.handleChangeStatus();
         return;
       case "commit":
         await this.handleCommit(msg);
@@ -475,7 +510,7 @@ export class TaskDetailPanel {
 
   private async handleMergeTaskPRs(): Promise<void> {
     if (!this.state) return;
-    const prs = this.state.prMatches;
+    const prs = this.state.prMatches.filter((p) => p.state === "open" && !p.merged);
     if (prs.length === 0) {
       void vscode.window.showWarningMessage(
         "Hareer: No open PR found whose branch contains this task ID.",
@@ -543,6 +578,98 @@ export class TaskDetailPanel {
         void this.service.refresh();
       },
     );
+  }
+
+  private async handleDeleteTaskBranches(): Promise<void> {
+    if (!this.state) return;
+    const deletable = this.state.prMatches.filter(
+      (p) => p.merged && p.headBranchExists && !isProtectedBranch(p.headRef, p.baseRef),
+    );
+    if (deletable.length === 0) {
+      void vscode.window.showInformationMessage("Hareer: No deletable branches found.");
+      return;
+    }
+
+    const branchList = deletable.map((p) => `${p.repoName}: ${p.headRef}`).join("\n");
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete ${deletable.length} merged branch${deletable.length === 1 ? "" : "es"}?\n${branchList}`,
+      { modal: true },
+      "Delete",
+    );
+    if (confirmed !== "Delete") return;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Deleting ${deletable.length} branch${deletable.length === 1 ? "" : "es"}…`,
+        cancellable: false,
+      },
+      async () => {
+        const deleted: string[] = [];
+        const failed: string[] = [];
+
+        for (const p of deletable) {
+          try {
+            await deleteBranch(p.owner, p.repo, p.headRef);
+            invalidatePR(p.owner, p.repo, p.prNumber);
+            deleted.push(`${p.repoName}: ${p.headRef}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            failed.push(`${p.repoName}: ${p.headRef} — ${msg}`);
+          }
+        }
+
+        if (deleted.length > 0) {
+          void vscode.window.showInformationMessage(
+            `Hareer: Deleted ${deleted.length} branch${deleted.length === 1 ? "" : "es"} — ${deleted.join(", ")}.`,
+          );
+        }
+        if (failed.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: ${failed.length} branch${failed.length === 1 ? "" : "es"} could not be deleted — ${failed.join("; ")}`,
+          );
+        }
+
+        void this.discoverContext();
+        void this.service.refresh();
+      },
+    );
+  }
+
+  private async handleChangeStatus(): Promise<void> {
+    if (!this.state) return;
+    const token = await getClickUpToken(this.context);
+    if (!token) {
+      void vscode.window.showWarningMessage("Hareer: Connect ClickUp first.");
+      return;
+    }
+
+    let statuses: ClickUpStatus[];
+    try {
+      statuses = await getListStatuses(token, this.state.task.list.id);
+    } catch {
+      void vscode.window.showErrorMessage("Hareer: Failed to fetch task statuses.");
+      return;
+    }
+
+    const current = this.state.task.status.status.toLowerCase();
+    const items = statuses.map((s) => ({
+      label: s.status,
+      description: s.status.toLowerCase() === current ? "(current)" : undefined,
+    }));
+
+    const picked = await vscode.window.showQuickPick(items, {
+      placeHolder: `Change status from "${this.state.task.status.status}"`,
+    });
+    if (!picked || picked.label.toLowerCase() === current) return;
+
+    try {
+      await updateTaskStatus(token, this.state.task.id, picked.label);
+      void this.service.refresh();
+      await this.show(this.state.taskId);
+    } catch {
+      void vscode.window.showErrorMessage("Hareer: Failed to update task status.");
+    }
   }
 
   /** Route a matched PR into the Code Review tree (no standalone detail panel). */
@@ -864,8 +991,8 @@ export class TaskDetailPanel {
 
             // Skip if an open PR already exists for this head (force a fresh read).
             try {
-              const prs = await getOpenPRs(target.owner, target.repo, { force: true });
-              const existing = prs.find((p) => p.headRef === branch);
+              const prs = await getAllPRs(target.owner, target.repo, { force: true });
+              const existing = prs.find((p: { headRef: string; number: number; state: string }) => p.headRef === branch && p.state === "open");
               if (existing) {
                 skipped.push(`${target.name} (PR #${existing.number} already open)`);
                 continue;
@@ -1249,8 +1376,13 @@ export class TaskDetailPanel {
         repo: p.repo,
         prNumber: p.prNumber,
         headRef: p.headRef,
+        baseRef: p.baseRef,
         title: p.title,
         url: p.url,
+        state: p.state,
+        merged: p.merged,
+        mergeable: p.mergeable,
+        headBranchExists: p.headBranchExists,
       })),
       cursorCommitGenerate: isCursorIDE(),
     });
@@ -1456,6 +1588,18 @@ body {
 }
 .error-banner button { margin-left: auto; }
 
+/* ------- Warning banner ------- */
+.warning-banner {
+  margin: 12px 0 4px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--hareer-warning) 12%, transparent);
+  color: var(--hareer-warning);
+  border: 1px solid color-mix(in srgb, var(--hareer-warning) 40%, transparent);
+  border-radius: 6px;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 0.85rem;
+}
+
 /* ------- Layout ------- */
 .task-layout {
   display: grid;
@@ -1524,6 +1668,10 @@ h2:first-child { margin-top: 0; }
 .action-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
 .action-btn .count { background: rgba(255,255,255,0.15); padding: 0 5px; border-radius: 8px; font-size: 0.7rem; }
 .action-btn.primary .count { background: rgba(255,255,255,0.25); }
+.action-btn.danger { background: color-mix(in srgb, var(--hareer-danger) 15%, transparent); color: var(--hareer-danger); border-color: color-mix(in srgb, var(--hareer-danger) 40%, transparent); }
+.action-btn.danger:hover { background: color-mix(in srgb, var(--hareer-danger) 25%, transparent); }
+.status-badge { cursor: pointer; }
+.status-badge:hover { opacity: 0.8; }
 .collapsible-section { margin-top: 8px; }
 
 /* ------- Description with fade + expand ------- */
@@ -1807,7 +1955,7 @@ function render() {
 
   const statusBg = 'color-mix(in srgb, ' + t.status.color + ' 14%, transparent)';
   const statusBorder = 'color-mix(in srgb, ' + t.status.color + ' 50%, transparent)';
-  const statusBadge = '<span class="status-badge" style="color:' + t.status.color + ';background:' + statusBg + ';border-color:' + statusBorder + '"><span class="status-dot" style="background:' + t.status.color + '"></span>' + escape(t.status.status) + '</span>';
+  const statusBadge = '<span class="status-badge" id="status-badge" title="Click to change status" style="color:' + t.status.color + ';background:' + statusBg + ';border-color:' + statusBorder + '"><span class="status-dot" style="background:' + t.status.color + '"></span>' + escape(t.status.status) + '</span>';
 
   const priorityBadge = t.priority
     ? '<span class="priority-pill" style="color:' + t.priority.color + ';border-color:color-mix(in srgb, ' + t.priority.color + ' 50%, transparent);background:color-mix(in srgb, ' + t.priority.color + ' 12%, transparent)">⚑ ' + escape(t.priority.priority) + '</span>'
@@ -1838,8 +1986,18 @@ function render() {
 
   // Context-driven action buttons (under description)
   const branchCount = (model.branchMatches || []).length;
-  const prCount = (model.prMatches || []).length;
+  const allPRs = model.prMatches || [];
+  const openPRs = allPRs.filter((p) => p.state === 'open' && !p.merged);
+  const mergedPRs = allPRs.filter((p) => p.merged);
+  const conflictedPRs = openPRs.filter((p) => p.mergeable === false);
+  const openPRCount = openPRs.length;
+  const allMerged = allPRs.length > 0 && openPRCount === 0 && mergedPRs.length > 0;
+  const deletableBranches = mergedPRs.filter((p) => p.headBranchExists);
   if (branchCount > 0) savedState.showBranchSection = false;
+
+  const conflictBannerHtml = conflictedPRs.length > 0
+    ? '<div class="warning-banner">⚠ ' + conflictedPRs.length + ' PR' + (conflictedPRs.length === 1 ? '' : 's') + ' have merge conflicts: ' + conflictedPRs.map((p) => escape(p.headRef)).join(', ') + '</div>'
+    : '';
 
   const actionBtns = [];
   if (branchCount > 0) {
@@ -1851,18 +2009,25 @@ function render() {
   } else {
     actionBtns.push('<button class="action-btn primary" id="action-create-branch">＋ Create Branch</button>');
   }
-  if (branchCount > 0 && prCount === 0 && !linked) {
+  if (branchCount > 0 && openPRCount === 0 && !linked && !allMerged) {
     actionBtns.push('<button class="action-btn" id="action-create-pr">Create PR</button>');
   }
-  if (prCount > 0) {
+  if (openPRCount > 0) {
     actionBtns.push(
-      '<button class="action-btn primary" id="action-review" title="Open code review for ' + prCount + ' matching PR' + (prCount === 1 ? '' : 's') + '">' +
-        '👁 Code Review <span class="count">' + prCount + '</span>' +
+      '<button class="action-btn primary" id="action-review" title="Open code review for ' + openPRCount + ' matching PR' + (openPRCount === 1 ? '' : 's') + '">' +
+        '👁 Code Review <span class="count">' + openPRCount + '</span>' +
       '</button>',
     );
     actionBtns.push(
-      '<button class="action-btn" id="action-merge-prs" title="Merge ' + prCount + ' PR' + (prCount === 1 ? '' : 's') + ' and mark ready to deploy">' +
-        '⤭ Merge' + (prCount > 1 ? ' <span class="count">' + prCount + '</span>' : '') +
+      '<button class="action-btn" id="action-merge-prs" title="Merge ' + openPRCount + ' PR' + (openPRCount === 1 ? '' : 's') + ' and mark ready to deploy">' +
+        '⤭ Merge' + (openPRCount > 1 ? ' <span class="count">' + openPRCount + '</span>' : '') +
+      '</button>',
+    );
+  }
+  if (allMerged && deletableBranches.length > 0) {
+    actionBtns.push(
+      '<button class="action-btn danger" id="action-delete-branches" title="Delete ' + deletableBranches.length + ' merged branch' + (deletableBranches.length === 1 ? '' : 'es') + '">' +
+        '🗑 Delete branches' + (deletableBranches.length > 1 ? ' <span class="count">' + deletableBranches.length + '</span>' : '') +
       '</button>',
     );
   }
@@ -1872,7 +2037,7 @@ function render() {
       (linked ? '🔗 Replace link' : '🔗 Link existing PR') +
     '</button>',
   );
-  const actionsHtml = '<div class="task-actions">' + actionBtns.join('') + '</div>';
+  const actionsHtml = conflictBannerHtml + '<div class="task-actions">' + actionBtns.join('') + '</div>';
 
   // Determine which repos are selected for branch creation. Default: all submodules
   // (or the single workspace repo if no .gitmodules).
@@ -2113,6 +2278,10 @@ function bindEvents() {
   if (actionReview) actionReview.addEventListener("click", () => vscode.postMessage({ type: "openTaskReview" }));
   const actionMergePRs = document.getElementById("action-merge-prs");
   if (actionMergePRs) actionMergePRs.addEventListener("click", () => vscode.postMessage({ type: "mergeTaskPRs" }));
+  const actionDeleteBranches = document.getElementById("action-delete-branches");
+  if (actionDeleteBranches) actionDeleteBranches.addEventListener("click", () => vscode.postMessage({ type: "deleteTaskBranches" }));
+  const statusBadgeEl = document.getElementById("status-badge");
+  if (statusBadgeEl) statusBadgeEl.addEventListener("click", () => vscode.postMessage({ type: "changeStatus" }));
   const actionCommit = document.getElementById("action-commit");
   if (actionCommit) actionCommit.addEventListener("click", () => {
     savedState.showCommitSection = true;

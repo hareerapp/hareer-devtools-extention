@@ -10,6 +10,7 @@ export interface PullRequest {
   readonly number: number;
   readonly title: string;
   readonly state: "open" | "closed";
+  readonly merged?: boolean;
   readonly headSha: string;
   readonly baseSha: string;
   readonly headRef: string;

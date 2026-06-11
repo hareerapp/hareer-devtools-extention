@@ -207,12 +207,12 @@
         },
         {
           "command": "hareer.discardReview",
-          "when": "view == hareerCodeReview && viewItem == prSelectorActivePending",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActivePending/",
           "group": "inline@3"
         },
         {
           "command": "hareer.mergePR",
-          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive/",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive.*Open/",
           "group": "inline@4"
         }
       ],

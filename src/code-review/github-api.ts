@@ -151,6 +151,7 @@ interface RawPR {
   number: number;
   title: string;
   state: string;
+  merged_at: string | null;
   html_url: string;
   head: { sha: string; ref: string };
   base: { sha: string; ref: string };
@@ -202,6 +203,46 @@ export async function fetchOpenPRs(owner: string, repo: string): Promise<PullReq
     baseRef: pr.base.ref,
     url: pr.html_url,
   }));
+}
+
+export async function fetchAllPRs(owner: string, repo: string): Promise<PullRequest[]> {
+  const token = await getToken();
+  const raw = await githubRequest<RawPR[]>(
+    "GET",
+    `/repos/${owner}/${repo}/pulls?state=all&per_page=100`,
+    token,
+  );
+  return raw.map((pr) => ({
+    number: pr.number,
+    title: pr.title,
+    state: pr.state === "open" ? "open" : "closed",
+    merged: Boolean(pr.merged_at),
+    headSha: pr.head.sha,
+    baseSha: pr.base.sha,
+    headRef: pr.head.ref,
+    baseRef: pr.base.ref,
+    url: pr.html_url,
+  }));
+}
+
+export async function branchExists(
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<boolean> {
+  const token = await getToken();
+  const encoded = encodeURIComponent(branch).replace(/%2F/g, "/");
+  try {
+    await githubRequest<unknown>(
+      "GET",
+      `/repos/${owner}/${repo}/branches/${encoded}`,
+      token,
+    );
+    return true;
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("404")) return false;
+    throw err;
+  }
 }
 
 export async function fetchPRByNumber(

@@ -1,5 +1,6 @@
 import { PersistentCache, swr, TTL } from "../cache";
 import {
+  fetchAllPRs,
   fetchOpenPRs,
   fetchPRChecks,
   fetchPRComments,
@@ -30,6 +31,9 @@ interface ReadOptions {
 }
 
 const openPRsKey = (owner: string, repo: string): string => `openPRs.${owner}/${repo}`;
+const allPRsKey = (owner: string, repo: string): string => `allPRs.${owner}/${repo}`;
+const prDetailKey = (owner: string, repo: string, n: number): string =>
+  `prDetail.${owner}/${repo}#${n}`;
 const prFilesKey = (owner: string, repo: string, n: number): string =>
   `prFiles.${owner}/${repo}#${n}`;
 const prBundleKey = (owner: string, repo: string, n: number): string =>
@@ -42,6 +46,28 @@ export interface PRBundle {
   readonly lineComments: ReviewComment[];
   readonly files: PRFile[];
   readonly checks: PRCheckRun[];
+}
+
+export function getAllPRs(
+  owner: string,
+  repo: string,
+  opts: ReadOptions = {},
+  onUpdate?: (prs: PullRequest[]) => void,
+): Promise<PullRequest[]> {
+  const fetcher = (): Promise<PullRequest[]> => fetchAllPRs(owner, repo);
+  if (!cache) return fetcher();
+  return swr(cache, allPRsKey(owner, repo), fetcher, { ttlMs: TTL.openPRs, force: opts.force }, onUpdate);
+}
+
+export function getCachedPRDetail(
+  owner: string,
+  repo: string,
+  n: number,
+  opts: ReadOptions = {},
+): Promise<PRDetail> {
+  const fetcher = (): Promise<PRDetail> => fetchPRDetail(owner, repo, n);
+  if (!cache) return fetcher();
+  return swr(cache, prDetailKey(owner, repo, n), fetcher, { ttlMs: TTL.prBundle, force: opts.force });
 }
 
 export function getOpenPRs(
@@ -93,7 +119,9 @@ export function getPRBundle(
 export function invalidatePR(owner: string, repo: string, n?: number): void {
   if (!cache) return;
   cache.delete(openPRsKey(owner, repo));
+  cache.delete(allPRsKey(owner, repo));
   if (n !== undefined) {
+    cache.delete(prDetailKey(owner, repo, n));
     cache.delete(prFilesKey(owner, repo, n));
     cache.delete(prBundleKey(owner, repo, n));
   }
@@ -103,6 +131,8 @@ export function invalidatePR(owner: string, repo: string, n?: number): void {
 export function clearAllPRCache(): void {
   if (!cache) return;
   cache.deleteByPrefix("openPRs.");
+  cache.deleteByPrefix("allPRs.");
+  cache.deleteByPrefix("prDetail.");
   cache.deleteByPrefix("prFiles.");
   cache.deleteByPrefix("prBundle.");
 }

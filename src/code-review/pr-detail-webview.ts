@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { createIssueComment, deleteBranch, isProtectedBranch, mergePR } from "./github-api";
+import { branchExists, createIssueComment, deleteBranch, isProtectedBranch, mergePR } from "./github-api";
 import { getPRBundle, invalidatePR } from "./pr-cache";
 import type { PRBundle } from "./pr-cache";
 import type {
@@ -25,6 +25,7 @@ interface PanelState {
   lineComments?: ReviewComment[];
   files?: PRFile[];
   checks?: PRCheckRun[];
+  headBranchExists?: boolean;
 }
 
 type InboundMessage =
@@ -85,8 +86,6 @@ export class PRDetailPanel {
   }
 
   private state: PanelState;
-  /** Set once the user deletes the head branch from this panel, to hide the button. */
-  private branchDeleted = false;
   private readonly disposables: vscode.Disposable[] = [];
 
   private constructor(private readonly panel: vscode.WebviewPanel) {
@@ -112,7 +111,6 @@ export class PRDetailPanel {
 
   async show(submodule: Submodule, prNumber: number): Promise<void> {
     this.state = { submodule, prNumber };
-    this.branchDeleted = false;
     this.panel.title = `PR #${prNumber} · ${submodule.repo}`;
     this.panel.webview.html = this.render();
     this.panel.reveal(vscode.ViewColumn.Active, false);
@@ -122,10 +120,13 @@ export class PRDetailPanel {
   private async refresh(force = false): Promise<void> {
     const { submodule, prNumber } = this.state;
 
-    // Apply a bundle to the panel only if it's still showing the same PR.
-    const apply = (b: PRBundle): void => {
+    const applyBundle = async (b: PRBundle): Promise<void> => {
       if (this.state.submodule.name !== submodule.name || this.state.prNumber !== prNumber) {
         return;
+      }
+      let headBranchExists = true;
+      if (b.detail.merged) {
+        headBranchExists = await branchExists(submodule.owner, submodule.repo, b.detail.headRef).catch(() => true);
       }
       this.state = {
         submodule,
@@ -136,9 +137,13 @@ export class PRDetailPanel {
         lineComments: b.lineComments,
         files: b.files,
         checks: b.checks,
+        headBranchExists,
       };
       this.postState();
     };
+
+    // Apply a bundle to the panel only if it's still showing the same PR.
+    const apply = (b: PRBundle): void => { void applyBundle(b); };
 
     try {
       // Cache hit paints instantly; a stale entry triggers the onUpdate repaint.
@@ -149,7 +154,7 @@ export class PRDetailPanel {
         { force },
         apply,
       );
-      apply(bundle);
+      await applyBundle(bundle);
     } catch (err) {
       if (this.state.detail) return; // keep showing cached data on a failed revalidate
       const msg = err instanceof Error ? err.message : String(err);
@@ -210,10 +215,9 @@ export class PRDetailPanel {
     if (confirmed !== "Delete branch") return;
     try {
       await deleteBranch(submodule.owner, submodule.repo, detail.headRef);
-      this.branchDeleted = true;
       invalidatePR(submodule.owner, submodule.repo, prNumber);
       void vscode.window.showInformationMessage(`Hareer: Deleted branch ${detail.headRef}.`);
-      this.postState();
+      await this.refresh(true);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Hareer: Could not delete ${detail.headRef} — ${msg}`);
@@ -273,7 +277,7 @@ export class PRDetailPanel {
       files: files ?? [],
       checks: checks ?? [],
       canDeleteBranch:
-        detail.merged && !this.branchDeleted && !isProtectedBranch(detail.headRef, detail.baseRef),
+        detail.merged && (this.state.headBranchExists ?? true) && !isProtectedBranch(detail.headRef, detail.baseRef),
     });
   }
 
