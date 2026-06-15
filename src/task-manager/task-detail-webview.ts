@@ -79,6 +79,8 @@ interface BranchMatch {
   readonly repoName: string;
   readonly absPath: string;
   readonly branch: string;
+  /** True when this repo's HEAD is already on `branch` (checkout is a no-op). */
+  readonly checkedOut: boolean;
 }
 
 interface PRMatch {
@@ -237,7 +239,16 @@ export class TaskDetailPanel {
             () => findTaskBranch(r.absPath, taskKey),
             { ttlMs: TTL.branches },
           );
-          return branch ? { repoPath: r.path, repoName: r.name, absPath: r.absPath, branch } : null;
+          if (!branch) return null;
+          // Read HEAD live (uncached) so the checkout state reflects reality.
+          const current = await currentBranchInDir(r.absPath);
+          return {
+            repoPath: r.path,
+            repoName: r.name,
+            absPath: r.absPath,
+            branch,
+            checkedOut: current === branch,
+          };
         }),
       );
       this.state.branchMatches = branchResults.filter((b): b is BranchMatch => b !== null);
@@ -1499,6 +1510,7 @@ export class TaskDetailPanel {
       branchMatches: this.state.branchMatches.map((b) => ({
         repoName: b.repoName,
         repoPath: b.repoPath,
+        checkedOut: b.checkedOut,
         branch: b.branch,
       })),
       prMatches: this.state.prMatches.map((p) => ({
@@ -2125,7 +2137,10 @@ function render() {
     : '<div class="empty">Not tracked</div>';
 
   // Context-driven action buttons (under description)
-  const branchCount = (model.branchMatches || []).length;
+  const branchMatches = model.branchMatches || [];
+  const branchCount = branchMatches.length;
+  // Repos with a matching branch that aren't already checked out to it.
+  const pendingCheckout = branchMatches.filter((b) => !b.checkedOut).length;
   const allPRs = model.prMatches || [];
   const openPRs = allPRs.filter((p) => p.state === 'open' && !p.merged);
   const mergedPRs = allPRs.filter((p) => p.merged);
@@ -2140,13 +2155,16 @@ function render() {
     : '';
 
   const actionBtns = [];
-  if (branchCount > 0) {
+  if (pendingCheckout > 0) {
+    // At least one matched repo isn't on its branch yet — offer checkout.
     actionBtns.push(
-      '<button class="action-btn primary" id="action-checkout" title="Checkout matching branch in ' + branchCount + ' repo' + (branchCount === 1 ? '' : 's') + '">' +
-        '⤓ Checkout' + (branchCount > 1 ? ' <span class="count">' + branchCount + '</span>' : '') +
+      '<button class="action-btn primary" id="action-checkout" title="Checkout matching branch in ' + pendingCheckout + ' repo' + (pendingCheckout === 1 ? '' : 's') + '">' +
+        '⤓ Checkout' + (pendingCheckout > 1 ? ' <span class="count">' + pendingCheckout + '</span>' : '') +
       '</button>',
     );
-  } else {
+  } else if (branchCount === 0) {
+    // No matching branch anywhere — offer to create one. (When branches exist
+    // and are all checked out, neither button shows.)
     actionBtns.push('<button class="action-btn primary" id="action-create-branch">＋ Create Branch</button>');
   }
   if (branchCount > 0 && openPRCount === 0 && !linked && !allMerged) {
