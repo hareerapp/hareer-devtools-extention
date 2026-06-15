@@ -146,6 +146,7 @@ export class TaskDetailPanel {
   }
 
   private state: PanelState | undefined;
+  private discovering = false;
   private readonly disposables: vscode.Disposable[] = [];
 
   private constructor(
@@ -191,6 +192,7 @@ export class TaskDetailPanel {
     try {
       const task = await getTask(token, taskId);
       this.state = { taskId, task, repos: [], branchMatches: [], prMatches: [] };
+      this.discovering = true;
       this.panel.title = task.customId ? `CU ${task.customId}` : `Task ${task.id.slice(0, 8)}`;
       this.postState();
       // Discover workspace context (repos, branches, PRs) async — pushes
@@ -209,34 +211,39 @@ export class TaskDetailPanel {
 
   private async discoverContext(): Promise<void> {
     if (!this.state) return;
+    const taskId = this.state.taskId;
     const taskKey = (this.state.task.customId ?? this.state.task.id).trim();
-    const repos = await getWorkspaceRepos();
-    this.state.repos = repos.map((r) => ({
-      name: r.name,
-      path: r.path,
-      absPath: r.absPath,
-      isSubmodule: r.isSubmodule,
-      owner: r.owner,
-      repo: r.repo,
-    }));
-
-    // Branch discovery — parallel across repos, served from cache (revalidated).
-    const branchResults = await Promise.all(
-      repos.map(async (r) => {
-        const branch = await swr(
-          this.cache,
-          `branch.${r.absPath}.${taskKey}`,
-          () => findTaskBranch(r.absPath, taskKey),
-          { ttlMs: TTL.branches },
-        );
-        return branch ? { repoPath: r.path, repoName: r.name, absPath: r.absPath, branch } : null;
-      }),
-    );
-    this.state.branchMatches = branchResults.filter((b): b is BranchMatch => b !== null);
+    // Show a loading state on the action buttons until every source (repos,
+    // branches, PRs) has resolved, then reveal them all at once.
+    this.discovering = true;
     this.postState();
+    try {
+      const repos = await getWorkspaceRepos();
+      this.state.repos = repos.map((r) => ({
+        name: r.name,
+        path: r.path,
+        absPath: r.absPath,
+        isSubmodule: r.isSubmodule,
+        owner: r.owner,
+        repo: r.repo,
+      }));
 
-    // PR discovery — only for submodules with parsed owner/repo (i.e. GitHub).
-    const prResults = await Promise.all(
+      // Branch discovery — parallel across repos, served from cache (revalidated).
+      const branchResults = await Promise.all(
+        repos.map(async (r) => {
+          const branch = await swr(
+            this.cache,
+            `branch.${r.absPath}.${taskKey}`,
+            () => findTaskBranch(r.absPath, taskKey),
+            { ttlMs: TTL.branches },
+          );
+          return branch ? { repoPath: r.path, repoName: r.name, absPath: r.absPath, branch } : null;
+        }),
+      );
+      this.state.branchMatches = branchResults.filter((b): b is BranchMatch => b !== null);
+
+      // PR discovery — only for submodules with parsed owner/repo (i.e. GitHub).
+      const prResults = await Promise.all(
       repos
         .filter((r): r is WorkspaceRepo & { owner: string; repo: string } => Boolean(r.owner && r.repo))
         .map(async (r) => {
@@ -280,9 +287,16 @@ export class TaskDetailPanel {
             return [];
           }
         }),
-    );
-    this.state.prMatches = prResults.flat();
-    this.postState();
+      );
+      this.state.prMatches = prResults.flat();
+    } finally {
+      // Only clear the loading state if we're still on the same task — a newer
+      // show() may have started its own discovery while this one was in flight.
+      if (this.state?.taskId === taskId) {
+        this.discovering = false;
+        this.postState();
+      }
+    }
   }
 
   private async handleMessage(msg: InboundMessage): Promise<void> {
@@ -1427,6 +1441,7 @@ export class TaskDetailPanel {
     const task = this.state.task;
     void this.panel.webview.postMessage({
       type: "state",
+      discovering: this.discovering,
       task: {
         id: task.id,
         customId: task.customId ?? task.id,
@@ -1778,6 +1793,9 @@ h2:first-child { margin-top: 0; }
 
 /* ------- Task action buttons (under description) ------- */
 .task-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.task-actions.actions-loading { align-items: center; gap: 10px; min-height: 30px; color: var(--vscode-descriptionForeground); font-size: 0.85rem; }
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--vscode-foreground) 25%, transparent); border-top-color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); animation: hareer-spin 0.7s linear infinite; flex: none; }
+@keyframes hareer-spin { to { transform: rotate(360deg); } }
 .action-btn {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 6px 12px; border-radius: 12px; font-size: 0.78rem; font-weight: 600;
@@ -2159,7 +2177,12 @@ function render() {
       (linked ? '🔗 Replace link' : '🔗 Link existing PR') +
     '</button>',
   );
-  const actionsHtml = conflictBannerHtml + '<div class="task-actions">' + actionBtns.join('') + '</div>';
+  const actionsHtml = model.discovering
+    ? '<div class="task-actions actions-loading">' +
+        '<span class="spinner" aria-hidden="true"></span>' +
+        '<span>Loading actions…</span>' +
+      '</div>'
+    : conflictBannerHtml + '<div class="task-actions">' + actionBtns.join('') + '</div>';
 
   // Determine which repos are selected for branch creation. Default: all submodules
   // (or the single workspace repo if no .gitmodules).
