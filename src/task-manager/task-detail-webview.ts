@@ -466,6 +466,12 @@ export class TaskDetailPanel {
   private async handleOpenTaskReview(): Promise<void> {
     if (!this.state) return;
     const prs = this.state.prMatches;
+
+    await vscode.commands.executeCommand(
+      "hareer.retainCodeReviewPRs",
+      prs.map((p) => ({ submoduleName: p.repoName, prNumber: p.prNumber })),
+    );
+
     if (prs.length === 0) {
       void vscode.window.showWarningMessage(
         "Hareer: No open PR found whose branch contains this task ID.",

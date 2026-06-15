@@ -61,6 +61,18 @@ interface SubmoduleState {
   commentCounts: Map<string, number>;
 }
 
+/** A submodule's state with no PR selected — the single source of truth for
+ *  both first-time init and clearing an existing selection. */
+function emptySubmoduleState(): SubmoduleState {
+  return {
+    selectedPR: undefined,
+    files: [],
+    folderTree: { folders: new Map(), files: [] },
+    loading: false,
+    commentCounts: new Map(),
+  };
+}
+
 export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<
     CodeReviewNode | undefined
@@ -93,6 +105,20 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
   getSelectedPR(submodule: Submodule): PullRequest | undefined {
     return this.state.get(submodule.name)?.selectedPR;
+  }
+
+  clearSelectionsExcept(
+    keep: ReadonlyArray<{ submoduleName: string; prNumber: number }>,
+  ): void {
+    const keepKeys = new Set(keep.map((k) => `${k.submoduleName}#${k.prNumber}`));
+    let changed = false;
+    for (const [name, st] of this.state) {
+      if (!st.selectedPR) continue;
+      if (keepKeys.has(`${name}#${st.selectedPR.number}`)) continue;
+      this.state.set(name, emptySubmoduleState());
+      changed = true;
+    }
+    if (changed) this._onDidChangeTreeData.fire(undefined);
   }
 
   async selectPR(submodule: Submodule): Promise<void> {
@@ -270,13 +296,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
   private ensureState(submodule: Submodule): SubmoduleState {
     let st = this.state.get(submodule.name);
     if (!st) {
-      st = {
-        selectedPR: undefined,
-        files: [],
-        folderTree: { folders: new Map(), files: [] },
-        loading: false,
-        commentCounts: new Map(),
-      };
+      st = emptySubmoduleState();
       this.state.set(submodule.name, st);
     }
     return st;

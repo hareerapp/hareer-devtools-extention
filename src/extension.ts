@@ -267,6 +267,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     ),
 
     vscode.commands.registerCommand(
+      "hareer.retainCodeReviewPRs",
+      (keep: ReadonlyArray<{ submoduleName: string; prNumber: number }> | undefined) => {
+        codeReviewProvider.clearSelectionsExcept(keep ?? []);
+      },
+    ),
+
+    vscode.commands.registerCommand(
       "hareer.showPRInCodeReview",
       async (submodule: Submodule | undefined, prNumber: number | undefined) => {
         if (!submodule || typeof prNumber !== "number") return;
