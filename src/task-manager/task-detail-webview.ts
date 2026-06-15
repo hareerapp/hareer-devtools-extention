@@ -25,7 +25,7 @@ import {
   stageAllInDir,
 } from "./git-operations";
 import type { Repository } from "./git-operations";
-import { formatBranchName, validateGitRef } from "./branch-naming";
+import { formatBranchName, formatPRTitle, validateGitRef } from "./branch-naming";
 import { deriveScopeFromBranch, formatCommitMessage } from "./commit-naming";
 import {
   generateCommitMessageViaCursor,
@@ -37,6 +37,7 @@ import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
 import { getAllPRs, getCachedPRDetail, invalidatePR } from "../code-review/pr-cache";
+import type { PullRequest } from "../code-review/types";
 import { branchExists, deleteBranch, isProtectedBranch, mergePR } from "../code-review/github-api";
 import { PersistentCache, swr, TTL } from "../cache";
 import { execFile } from "node:child_process";
@@ -1235,12 +1236,119 @@ export class TaskDetailPanel {
     }
   }
 
-  /** Show a native input box to capture a PR URL, then link it (webview prompt() is disabled). */
+  /**
+   * Link an existing PR to the task: pick a submodule, pick one of its PRs,
+   * rename the PR to follow the ClickUp-id convention (`[CU-123] …`), then
+   * store its URL on the task. Only one PR is linked per task — relinking
+   * replaces the existing link after a confirm. Falls back to a paste-a-URL
+   * input box when the workspace has no GitHub-backed submodules.
+   */
   private async promptLinkPR(): Promise<void> {
     if (!this.state) return;
     const fieldName = vscode.workspace
       .getConfiguration("hareer.clickup")
       .get<string>("prUrlFieldName", "Github PR Url");
+
+    // 1. Pick a GitHub-backed submodule (skip the picker when there's only one).
+    const ghRepos = this.state.repos.filter(
+      (r): r is RepoInfo & { owner: string; repo: string } => Boolean(r.owner && r.repo),
+    );
+    if (ghRepos.length === 0) {
+      await this.promptPastePRUrl(fieldName);
+      return;
+    }
+    let repo = ghRepos[0];
+    if (ghRepos.length > 1) {
+      const picked = await vscode.window.showQuickPick(
+        ghRepos.map((r) => ({
+          label: r.name,
+          description: `${r.owner}/${r.repo}`,
+          repo: r,
+        })),
+        { placeHolder: "Pick a submodule to link a PR from" },
+      );
+      if (!picked) return;
+      repo = picked.repo;
+    }
+
+    // 2. Pick one of that submodule's PRs (open ones first).
+    let prs: PullRequest[];
+    try {
+      prs = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Loading PRs for ${repo.name}…`,
+          cancellable: false,
+        },
+        () => getAllPRs(repo.owner, repo.repo, { force: true }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Hareer: Could not load PRs for ${repo.name} — ${msg}`);
+      return;
+    }
+    if (prs.length === 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `Hareer: No PRs found in ${repo.name}.`,
+        "Paste URL instead",
+      );
+      if (choice === "Paste URL instead") await this.promptPastePRUrl(fieldName);
+      return;
+    }
+    const sorted = [...prs].sort((a, b) =>
+      a.state === b.state ? b.number - a.number : a.state === "open" ? -1 : 1,
+    );
+    const pickedPR = await vscode.window.showQuickPick(
+      sorted.map((p) => ({
+        label: `#${p.number} · ${p.title}`,
+        description: [p.merged ? "merged" : p.state, p.headRef].join(" · "),
+        pr: p,
+      })),
+      { placeHolder: `Pick a PR from ${repo.name} to link to this task` },
+    );
+    if (!pickedPR) return;
+    const pr = pickedPR.pr;
+
+    // 3. Enforce one linked PR per task — confirm before replacing a different one.
+    const existing = getLinkedPR(this.state.task, fieldName);
+    if (existing && existing.url !== pr.url) {
+      const choice = await vscode.window.showWarningMessage(
+        `Hareer: This task already links PR #${existing.number} (${existing.owner}/${existing.repo}). Replace it with #${pr.number}?`,
+        { modal: true },
+        "Replace",
+      );
+      if (choice !== "Replace") return;
+    }
+
+    // 4. Apply the ClickUp-id convention to the PR title (best-effort).
+    const taskId = (this.state.task.customId ?? this.state.task.id).trim();
+    const newTitle = formatPRTitle(taskId, pr.title);
+    if (newTitle !== pr.title) {
+      if (await ghIsAvailable()) {
+        try {
+          await ghPREdit(repo.absPath, pr.url, newTitle);
+          invalidatePR(repo.owner, repo.repo, pr.number);
+          this.postFlash(`Renamed PR #${pr.number} → ${newTitle}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          void vscode.window.showWarningMessage(
+            `Hareer: Linked PR but could not rename it — ${msg}`,
+          );
+        }
+      } else {
+        void vscode.window.showWarningMessage(
+          "Hareer: `gh` (GitHub CLI) not found — linked PR without applying the title convention.",
+        );
+      }
+    }
+
+    // 5. Store the PR URL on the ClickUp task.
+    await this.handleLinkPR(pr.url);
+  }
+
+  /** Native input-box fallback used when no GitHub submodule PRs are available. */
+  private async promptPastePRUrl(fieldName: string): Promise<void> {
+    if (!this.state) return;
     const current = getLinkedPR(this.state.task, fieldName)?.url ?? "";
     const url = await vscode.window.showInputBox({
       prompt: "Paste the GitHub PR URL to link to this ClickUp task",
@@ -1521,6 +1629,11 @@ async function ghPRCreate(
     .find((l) => /^https:\/\/github\.com\//.test(l));
   if (!url) throw new Error(`gh pr create returned no URL: ${out}`);
   return url;
+}
+
+/** Rename an existing PR (identified by URL or number) via `gh pr edit`. */
+async function ghPREdit(cwd: string, prRef: string, title: string): Promise<void> {
+  await runCommand("gh", ["pr", "edit", prRef, "--title", title], cwd);
 }
 
 async function fetchPRHeadRef(owner: string, repo: string, number: number): Promise<string> {

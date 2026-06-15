@@ -25,6 +25,15 @@ export function formatBranchName(desc: BranchDescriptor): string {
   return `${desc.type}/${id}-${slug}`;
 }
 
+export function formatPRTitle(taskId: string, currentTitle: string): string {
+  const id = taskId.trim();
+  const prefix = `[${id}]`;
+  const title = currentTitle.trim();
+  if (id.length === 0) return title;
+  if (title === prefix || title.startsWith(`${prefix} `)) return title;
+  return title.length > 0 ? `${prefix} ${title}` : prefix;
+}
+
 /**
  * Validate against git's ref naming rules
  * (https://git-scm.com/docs/git-check-ref-format).
