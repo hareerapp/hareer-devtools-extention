@@ -118,7 +118,21 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
       this.state.set(name, emptySubmoduleState());
       changed = true;
     }
-    if (changed) this._onDidChangeTreeData.fire(undefined);
+    if (changed) {
+      this.updateHasSelectionContext();
+      this._onDidChangeTreeData.fire(undefined);
+    }
+  }
+  clearAllSelections(): void {
+    this.clearSelectionsExcept([]);
+  }
+  private updateHasSelectionContext(): void {
+    const has = [...this.state.values()].some((st) => st.selectedPR !== undefined);
+    void vscode.commands.executeCommand(
+      "setContext",
+      "hareer.codeReview.hasSelection",
+      has,
+    );
   }
 
   async selectPR(submodule: Submodule): Promise<void> {
@@ -217,6 +231,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     st.folderTree = buildFolderTree(files);
     st.commentCounts = new Map();
     st.loading = false;
+    this.updateHasSelectionContext();
     this._onDidChangeTreeData.fire(undefined);
     void this.loadCommentCounts(submodule, selectedPR.number);
 
@@ -263,6 +278,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     st.folderTree = buildFolderTree(files);
     st.commentCounts = new Map();
     st.loading = false;
+    this.updateHasSelectionContext();
     this._onDidChangeTreeData.fire(undefined);
     void this.loadCommentCounts(submodule, pr.number);
 

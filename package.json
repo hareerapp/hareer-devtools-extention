@@ -47,6 +47,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "hareer.clearCodeReview",
+        "title": "Hareer: Clear Code Review",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "hareer.reconnectGitHub",
         "title": "Hareer: Reconnect GitHub (fix 401/404 scope issues)",
         "icon": "$(sign-in)"
@@ -169,9 +174,14 @@
           "group": "navigation"
         },
         {
+          "command": "hareer.clearCodeReview",
+          "when": "view == hareerCodeReview && hareer.codeReview.hasSelection",
+          "group": "navigation@1"
+        },
+        {
           "command": "hareer.refreshCodeReview",
           "when": "view == hareerCodeReview",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "hareer.refreshTasks",

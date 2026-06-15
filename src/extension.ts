@@ -225,6 +225,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       codeReviewProvider.refresh();
     }),
 
+    vscode.commands.registerCommand("hareer.clearCodeReview", () => {
+      codeReviewProvider.clearAllSelections();
+    }),
+
     vscode.commands.registerCommand("hareer.reconnectGitHub", async () => {
       try {
         await reconnectGitHub();
