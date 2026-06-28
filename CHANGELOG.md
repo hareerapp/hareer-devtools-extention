@@ -5,6 +5,15 @@ All notable changes to the **Hareer DevTools** extension are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-06-28
+
+### Fixed
+- **Teammates list no longer crashes on pending members** — sorting the team panel
+  threw `Cannot read properties of null (reading 'localeCompare')` when a ClickUp
+  member was invited but had not finished onboarding (the API returns a `null`
+  username). User mapping now falls back to the member's email, so the panel and
+  task views stay safe.
+
 ## [0.5.6] - 2026-06-15
 
 ### Added
