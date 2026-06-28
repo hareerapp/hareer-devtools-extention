@@ -59,6 +59,7 @@ export async function disconnectClickUp(
   );
   if (confirmed !== "Disconnect") return;
   await clearClickUpToken(context);
+  service.clearCache();
   await service.refresh();
   void vscode.window.showInformationMessage("Hareer: ClickUp disconnected.");
 }

@@ -25,21 +25,24 @@ import {
   stageAllInDir,
 } from "./git-operations";
 import type { Repository } from "./git-operations";
-import { formatBranchName, validateGitRef } from "./branch-naming";
+import { formatBranchName, formatPRTitle, validateGitRef } from "./branch-naming";
 import { deriveScopeFromBranch, formatCommitMessage } from "./commit-naming";
 import {
   generateCommitMessageViaCursor,
   isCursorIDE,
 } from "./cursor-commit-generator";
 import { findPRField, getLinkedPR } from "./pr-url-field";
-import { getTask, setCustomFieldValue, updateTaskStatus } from "./clickup-api";
+import { getListStatuses, getTask, setCustomFieldValue, updateTaskStatus } from "./clickup-api";
 import { getClickUpToken } from "./auth";
 import { getWorkspaceRepos } from "./workspace-repos";
 import type { WorkspaceRepo } from "./workspace-repos";
-import { fetchOpenPRs } from "../code-review/github-api";
+import { getAllPRs, getCachedPRDetail, invalidatePR } from "../code-review/pr-cache";
+import type { PullRequest } from "../code-review/types";
+import { branchExists, deleteBranch, isProtectedBranch, mergePR } from "../code-review/github-api";
+import { PersistentCache, swr, TTL } from "../cache";
 import { execFile } from "node:child_process";
 import type { TaskService } from "./task-service";
-import type { BranchType, ClickUpTask, CommitType } from "./types";
+import type { BranchType, ClickUpStatus, ClickUpTask, CommitType } from "./types";
 
 // ============================================================================
 // Types
@@ -57,7 +60,10 @@ type InboundMessage =
   | { type: "generateCommit"; stageAll: boolean }
   | { type: "push" }
   | { type: "createPRs"; baseRef: string }
-  | { type: "linkPR"; url: string };
+  | { type: "mergeTaskPRs" }
+  | { type: "deleteTaskBranches" }
+  | { type: "changeStatus" }
+  | { type: "promptLinkPR" };
 
 interface RepoInfo {
   readonly name: string;
@@ -73,6 +79,8 @@ interface BranchMatch {
   readonly repoName: string;
   readonly absPath: string;
   readonly branch: string;
+  /** True when this repo's HEAD is already on `branch` (checkout is a no-op). */
+  readonly checkedOut: boolean;
 }
 
 interface PRMatch {
@@ -83,8 +91,15 @@ interface PRMatch {
   readonly repo: string;
   readonly prNumber: number;
   readonly headRef: string;
+  readonly baseRef: string;
   readonly title: string;
   readonly url: string;
+  readonly state: "open" | "closed";
+  readonly merged: boolean;
+  readonly mergeable: boolean | null;
+  readonly headBranchExists: boolean;
+  /** True when this is a merged, still-present, non-protected branch the user can delete. */
+  readonly deletable: boolean;
 }
 
 interface PanelState {
@@ -111,6 +126,7 @@ export class TaskDetailPanel {
   static async openOrReveal(
     context: vscode.ExtensionContext,
     service: TaskService,
+    cache: PersistentCache,
     taskId: string,
   ): Promise<void> {
     if (TaskDetailPanel.current) {
@@ -127,16 +143,18 @@ export class TaskDetailPanel {
         localResourceRoots: [],
       },
     );
-    TaskDetailPanel.current = new TaskDetailPanel(context, service, panel);
+    TaskDetailPanel.current = new TaskDetailPanel(context, service, cache, panel);
     await TaskDetailPanel.current.show(taskId);
   }
 
   private state: PanelState | undefined;
+  private discovering = false;
   private readonly disposables: vscode.Disposable[] = [];
 
   private constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly service: TaskService,
+    private readonly cache: PersistentCache,
     private readonly panel: vscode.WebviewPanel,
   ) {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -156,7 +174,7 @@ export class TaskDetailPanel {
     );
   }
 
-  async show(taskId: string): Promise<void> {
+  async show(taskId: string, force = false): Promise<void> {
     const token = await getClickUpToken(this.context);
     if (!token) {
       void vscode.window.showWarningMessage("Hareer: Connect ClickUp first.");
@@ -168,9 +186,15 @@ export class TaskDetailPanel {
       this.panel.webview.html = this.render();
       this.panel.reveal(vscode.ViewColumn.Active, false);
     }
+    if (force) {
+      this.cache.deleteByPrefix("branch.");
+      this.cache.deleteByPrefix("allPRs.");
+      this.cache.deleteByPrefix("prDetail.");
+    }
     try {
       const task = await getTask(token, taskId);
       this.state = { taskId, task, repos: [], branchMatches: [], prMatches: [] };
+      this.discovering = true;
       this.panel.title = task.customId ? `CU ${task.customId}` : `Task ${task.id.slice(0, 8)}`;
       this.postState();
       // Discover workspace context (repos, branches, PRs) async — pushes
@@ -182,56 +206,108 @@ export class TaskDetailPanel {
     }
   }
 
+  /** A new branch may now match the task id — drop cached branch lookups. */
+  private invalidateBranchCache(): void {
+    this.cache.deleteByPrefix("branch.");
+  }
+
   private async discoverContext(): Promise<void> {
     if (!this.state) return;
+    const taskId = this.state.taskId;
     const taskKey = (this.state.task.customId ?? this.state.task.id).trim();
-    const repos = await getWorkspaceRepos();
-    this.state.repos = repos.map((r) => ({
-      name: r.name,
-      path: r.path,
-      absPath: r.absPath,
-      isSubmodule: r.isSubmodule,
-      owner: r.owner,
-      repo: r.repo,
-    }));
-
-    // Branch discovery — parallel across repos.
-    const branchResults = await Promise.all(
-      repos.map(async (r) => {
-        const branch = await findTaskBranch(r.absPath, taskKey);
-        return branch ? { repoPath: r.path, repoName: r.name, absPath: r.absPath, branch } : null;
-      }),
-    );
-    this.state.branchMatches = branchResults.filter((b): b is BranchMatch => b !== null);
+    // Show a loading state on the action buttons until every source (repos,
+    // branches, PRs) has resolved, then reveal them all at once.
+    this.discovering = true;
     this.postState();
+    try {
+      const repos = await getWorkspaceRepos();
+      this.state.repos = repos.map((r) => ({
+        name: r.name,
+        path: r.path,
+        absPath: r.absPath,
+        isSubmodule: r.isSubmodule,
+        owner: r.owner,
+        repo: r.repo,
+      }));
 
-    // PR discovery — only for submodules with parsed owner/repo (i.e. GitHub).
-    const prResults = await Promise.all(
+      // Branch discovery — parallel across repos, served from cache (revalidated).
+      const branchResults = await Promise.all(
+        repos.map(async (r) => {
+          const branch = await swr(
+            this.cache,
+            `branch.${r.absPath}.${taskKey}`,
+            () => findTaskBranch(r.absPath, taskKey),
+            { ttlMs: TTL.branches },
+          );
+          if (!branch) return null;
+          // Read HEAD live (uncached) so the checkout state reflects reality.
+          const current = await currentBranchInDir(r.absPath);
+          return {
+            repoPath: r.path,
+            repoName: r.name,
+            absPath: r.absPath,
+            branch,
+            checkedOut: current === branch,
+          };
+        }),
+      );
+      this.state.branchMatches = branchResults.filter((b): b is BranchMatch => b !== null);
+
+      // PR discovery — only for submodules with parsed owner/repo (i.e. GitHub).
+      const prResults = await Promise.all(
       repos
         .filter((r): r is WorkspaceRepo & { owner: string; repo: string } => Boolean(r.owner && r.repo))
         .map(async (r) => {
           try {
-            const prs = await fetchOpenPRs(r.owner, r.repo);
-            return prs
-              .filter((p) => p.headRef.toLowerCase().includes(taskKey.toLowerCase()))
-              .map<PRMatch>((p) => ({
-                repoPath: r.path,
-                repoName: r.name,
-                absPath: r.absPath,
-                owner: r.owner,
-                repo: r.repo,
-                prNumber: p.number,
-                headRef: p.headRef,
-                title: p.title,
-                url: p.url,
-              }));
+            const prs = await getAllPRs(r.owner, r.repo);
+            const matches = prs.filter((p) => p.headRef.toLowerCase().includes(taskKey.toLowerCase()));
+            return Promise.all(
+              matches.map(async (p): Promise<PRMatch> => {
+                let mergeable: boolean | null = null;
+                let headBranchExists = true;
+                try {
+                  const detail = await getCachedPRDetail(r.owner, r.repo, p.number);
+                  mergeable = detail.mergeable;
+                } catch {
+                  // detail unavailable — mergeable stays null
+                }
+                if (p.merged) {
+                  headBranchExists = await branchExists(r.owner, r.repo, p.headRef).catch(() => true);
+                }
+                return {
+                  repoPath: r.path,
+                  repoName: r.name,
+                  absPath: r.absPath,
+                  owner: r.owner,
+                  repo: r.repo,
+                  prNumber: p.number,
+                  headRef: p.headRef,
+                  baseRef: p.baseRef,
+                  title: p.title,
+                  url: p.url,
+                  state: p.state,
+                  merged: p.merged,
+                  mergeable,
+                  headBranchExists,
+                  deletable:
+                    p.merged && headBranchExists && !isProtectedBranch(p.headRef, p.baseRef),
+                };
+              }),
+            );
           } catch {
             return [];
           }
         }),
-    );
-    this.state.prMatches = prResults.flat();
-    this.postState();
+      );
+      this.state.prMatches = prResults.flat();
+    } finally {
+      // Only clear the loading state if we're still on the same task — a newer
+      // show() may have started its own discovery while this one was in flight.
+      if (this.state?.taskId === taskId) {
+        this.discovering = false;
+        this.postState();
+      }
+    }
   }
 
   private async handleMessage(msg: InboundMessage): Promise<void> {
@@ -241,7 +317,7 @@ export class TaskDetailPanel {
         if (this.state) this.postState();
         return;
       case "refresh":
-        await this.show(this.state.taskId);
+        await this.show(this.state.taskId, true);
         return;
       case "openExternal":
         await vscode.env.openExternal(vscode.Uri.parse(msg.url));
@@ -258,6 +334,15 @@ export class TaskDetailPanel {
       case "openTaskReview":
         await this.handleOpenTaskReview();
         return;
+      case "mergeTaskPRs":
+        await this.handleMergeTaskPRs();
+        return;
+      case "deleteTaskBranches":
+        await this.handleDeleteTaskBranches();
+        return;
+      case "changeStatus":
+        await this.handleChangeStatus();
+        return;
       case "commit":
         await this.handleCommit(msg);
         return;
@@ -270,8 +355,8 @@ export class TaskDetailPanel {
       case "createPRs":
         await this.handleCreatePRs(msg.baseRef);
         return;
-      case "linkPR":
-        await this.handleLinkPR(msg.url);
+      case "promptLinkPR":
+        await this.promptLinkPR();
         return;
     }
   }
@@ -330,6 +415,7 @@ export class TaskDetailPanel {
             );
           }
           await this.maybeAutoTransition("in progress");
+          this.invalidateBranchCache();
           void this.discoverContext();
         },
       );
@@ -351,6 +437,7 @@ export class TaskDetailPanel {
           void vscode.window.showInformationMessage(`Hareer: Checked out ${branchName}`);
           this.postFlash(`On branch ${branchName}`);
           await this.maybeAutoTransition("in progress");
+          this.invalidateBranchCache();
           void this.discoverContext();
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -404,6 +491,12 @@ export class TaskDetailPanel {
   private async handleOpenTaskReview(): Promise<void> {
     if (!this.state) return;
     const prs = this.state.prMatches;
+
+    await vscode.commands.executeCommand(
+      "hareer.retainCodeReviewPRs",
+      prs.map((p) => ({ submoduleName: p.repoName, prNumber: p.prNumber })),
+    );
+
     if (prs.length === 0) {
       void vscode.window.showWarningMessage(
         "Hareer: No open PR found whose branch contains this task ID.",
@@ -449,6 +542,168 @@ export class TaskDetailPanel {
     }
     if (!picked.pr) return;
     await this.showPRInCodeReview(picked.pr);
+  }
+
+  private async handleMergeTaskPRs(): Promise<void> {
+    if (!this.state) return;
+    const prs = this.state.prMatches.filter((p) => p.state === "open" && !p.merged);
+    if (prs.length === 0) {
+      void vscode.window.showWarningMessage(
+        "Hareer: No open PR found whose branch contains this task ID.",
+      );
+      return;
+    }
+
+    const methodItems: (vscode.QuickPickItem & { method: "merge" | "squash" | "rebase" })[] = [
+      { label: "$(git-merge) Merge commit", description: "Create a merge commit", method: "merge" },
+      { label: "$(squash) Squash and merge", description: "Squash all commits into one", method: "squash" },
+      { label: "$(arrow-up) Rebase and merge", description: "Rebase commits onto base branch", method: "rebase" },
+    ];
+    const pickedMethod = await vscode.window.showQuickPick(methodItems, {
+      placeHolder: `Merge ${prs.length} PR${prs.length === 1 ? "" : "s"} for this task`,
+    });
+    if (!pickedMethod) return;
+    const method = pickedMethod.method;
+
+    const confirmed = await vscode.window.showWarningMessage(
+      `Merge ${prs.length} PR${prs.length === 1 ? "" : "s"} for this task and mark it "ready to deploy"?`,
+      { modal: true },
+      "Merge",
+    );
+    if (confirmed !== "Merge") return;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Merging ${prs.length} PR${prs.length === 1 ? "" : "s"}…`,
+        cancellable: false,
+      },
+      async () => {
+        const merged: string[] = [];
+        const failed: string[] = [];
+
+        for (const pr of prs) {
+          try {
+            await mergePR(pr.owner, pr.repo, pr.prNumber, method);
+            invalidatePR(pr.owner, pr.repo, pr.prNumber);
+            merged.push(`${pr.repoName} #${pr.prNumber}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            failed.push(`${pr.repoName} #${pr.prNumber}: ${msg}`);
+          }
+        }
+
+        if (merged.length > 0) {
+          this.postFlash(`Merged ${merged.length} PR${merged.length === 1 ? "" : "s"}.`);
+          void vscode.window.showInformationMessage(
+            `Hareer: Merged ${merged.length} PR${merged.length === 1 ? "" : "s"} — ${merged.join(", ")}.`,
+          );
+        }
+        if (failed.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: ${failed.length} PR${failed.length === 1 ? "" : "s"} could not be merged — ${failed.join("; ")}`,
+          );
+        }
+
+        // Only advance the task when every matched PR merged cleanly.
+        if (failed.length === 0 && merged.length > 0) {
+          await this.maybeAutoTransition("ready to deploy");
+        }
+
+        void this.discoverContext();
+        void this.service.refresh();
+      },
+    );
+  }
+
+  private async handleDeleteTaskBranches(): Promise<void> {
+    if (!this.state) return;
+    const deletable = this.state.prMatches.filter((p) => p.deletable);
+    if (deletable.length === 0) {
+      void vscode.window.showInformationMessage("Hareer: No deletable branches found.");
+      return;
+    }
+
+    const branchList = deletable.map((p) => `${p.repoName}: ${p.headRef}`).join("\n");
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete ${deletable.length} merged branch${deletable.length === 1 ? "" : "es"}?\n${branchList}`,
+      { modal: true },
+      "Delete",
+    );
+    if (confirmed !== "Delete") return;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Deleting ${deletable.length} branch${deletable.length === 1 ? "" : "es"}…`,
+        cancellable: false,
+      },
+      async () => {
+        const deleted: string[] = [];
+        const failed: string[] = [];
+
+        for (const p of deletable) {
+          try {
+            await deleteBranch(p.owner, p.repo, p.headRef);
+            invalidatePR(p.owner, p.repo, p.prNumber);
+            deleted.push(`${p.repoName}: ${p.headRef}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            failed.push(`${p.repoName}: ${p.headRef} — ${msg}`);
+          }
+        }
+
+        if (deleted.length > 0) {
+          void vscode.window.showInformationMessage(
+            `Hareer: Deleted ${deleted.length} branch${deleted.length === 1 ? "" : "es"} — ${deleted.join(", ")}.`,
+          );
+        }
+        if (failed.length > 0) {
+          void vscode.window.showWarningMessage(
+            `Hareer: ${failed.length} branch${failed.length === 1 ? "" : "es"} could not be deleted — ${failed.join("; ")}`,
+          );
+        }
+
+        void this.discoverContext();
+        void this.service.refresh();
+      },
+    );
+  }
+
+  private async handleChangeStatus(): Promise<void> {
+    if (!this.state) return;
+    const token = await getClickUpToken(this.context);
+    if (!token) {
+      void vscode.window.showWarningMessage("Hareer: Connect ClickUp first.");
+      return;
+    }
+
+    let statuses: ClickUpStatus[];
+    try {
+      statuses = await getListStatuses(token, this.state.task.list.id);
+    } catch {
+      void vscode.window.showErrorMessage("Hareer: Failed to fetch task statuses.");
+      return;
+    }
+
+    const current = this.state.task.status.status.toLowerCase();
+    const items = statuses.map((s) => ({
+      label: s.status,
+      description: s.status.toLowerCase() === current ? "(current)" : undefined,
+    }));
+
+    const picked = await vscode.window.showQuickPick(items, {
+      placeHolder: `Change status from "${this.state.task.status.status}"`,
+    });
+    if (!picked || picked.label.toLowerCase() === current) return;
+
+    try {
+      await updateTaskStatus(token, this.state.task.id, picked.label);
+      void this.service.refresh();
+      await this.show(this.state.taskId);
+    } catch {
+      void vscode.window.showErrorMessage("Hareer: Failed to update task status.");
+    }
   }
 
   /** Route a matched PR into the Code Review tree (no standalone detail panel). */
@@ -768,10 +1023,10 @@ export class TaskDetailPanel {
               }
             }
 
-            // Skip if an open PR already exists for this head.
+            // Skip if an open PR already exists for this head (force a fresh read).
             try {
-              const prs = await fetchOpenPRs(target.owner, target.repo);
-              const existing = prs.find((p) => p.headRef === branch);
+              const prs = await getAllPRs(target.owner, target.repo, { force: true });
+              const existing = prs.find((p) => p.headRef === branch && p.state === "open");
               if (existing) {
                 skipped.push(`${target.name} (PR #${existing.number} already open)`);
                 continue;
@@ -804,6 +1059,10 @@ export class TaskDetailPanel {
           void vscode.window.showWarningMessage(
             `Hareer: PR creation failed — ${errors.join("; ")}`,
           );
+        }
+        // New PRs exist now — drop the cached open-PR lists so discovery refetches.
+        for (const c of created) {
+          if (c.repo.owner && c.repo.repo) invalidatePR(c.repo.owner, c.repo.repo);
         }
         void this.discoverContext();
       },
@@ -1008,6 +1267,134 @@ export class TaskDetailPanel {
     }
   }
 
+  /**
+   * Link an existing PR to the task: pick a submodule, pick one of its PRs,
+   * rename the PR to follow the ClickUp-id convention (`[CU-123] …`), then
+   * store its URL on the task. Only one PR is linked per task — relinking
+   * replaces the existing link after a confirm. Falls back to a paste-a-URL
+   * input box when the workspace has no GitHub-backed submodules.
+   */
+  private async promptLinkPR(): Promise<void> {
+    if (!this.state) return;
+    const fieldName = vscode.workspace
+      .getConfiguration("hareer.clickup")
+      .get<string>("prUrlFieldName", "Github PR Url");
+
+    // 1. Pick a GitHub-backed submodule (skip the picker when there's only one).
+    const ghRepos = this.state.repos.filter(
+      (r): r is RepoInfo & { owner: string; repo: string } => Boolean(r.owner && r.repo),
+    );
+    if (ghRepos.length === 0) {
+      await this.promptPastePRUrl(fieldName);
+      return;
+    }
+    let repo = ghRepos[0];
+    if (ghRepos.length > 1) {
+      const picked = await vscode.window.showQuickPick(
+        ghRepos.map((r) => ({
+          label: r.name,
+          description: `${r.owner}/${r.repo}`,
+          repo: r,
+        })),
+        { placeHolder: "Pick a submodule to link a PR from" },
+      );
+      if (!picked) return;
+      repo = picked.repo;
+    }
+
+    // 2. Pick one of that submodule's PRs (open ones first).
+    let prs: PullRequest[];
+    try {
+      prs = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Loading PRs for ${repo.name}…`,
+          cancellable: false,
+        },
+        () => getAllPRs(repo.owner, repo.repo, { force: true }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Hareer: Could not load PRs for ${repo.name} — ${msg}`);
+      return;
+    }
+    if (prs.length === 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `Hareer: No PRs found in ${repo.name}.`,
+        "Paste URL instead",
+      );
+      if (choice === "Paste URL instead") await this.promptPastePRUrl(fieldName);
+      return;
+    }
+    const sorted = [...prs].sort((a, b) =>
+      a.state === b.state ? b.number - a.number : a.state === "open" ? -1 : 1,
+    );
+    const pickedPR = await vscode.window.showQuickPick(
+      sorted.map((p) => ({
+        label: `#${p.number} · ${p.title}`,
+        description: [p.merged ? "merged" : p.state, p.headRef].join(" · "),
+        pr: p,
+      })),
+      { placeHolder: `Pick a PR from ${repo.name} to link to this task` },
+    );
+    if (!pickedPR) return;
+    const pr = pickedPR.pr;
+
+    // 3. Enforce one linked PR per task — confirm before replacing a different one.
+    const existing = getLinkedPR(this.state.task, fieldName);
+    if (existing && existing.url !== pr.url) {
+      const choice = await vscode.window.showWarningMessage(
+        `Hareer: This task already links PR #${existing.number} (${existing.owner}/${existing.repo}). Replace it with #${pr.number}?`,
+        { modal: true },
+        "Replace",
+      );
+      if (choice !== "Replace") return;
+    }
+
+    // 4. Apply the ClickUp-id convention to the PR title (best-effort).
+    const taskId = (this.state.task.customId ?? this.state.task.id).trim();
+    const newTitle = formatPRTitle(taskId, pr.title);
+    if (newTitle !== pr.title) {
+      if (await ghIsAvailable()) {
+        try {
+          await ghPREdit(repo.absPath, pr.url, newTitle);
+          invalidatePR(repo.owner, repo.repo, pr.number);
+          this.postFlash(`Renamed PR #${pr.number} → ${newTitle}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          void vscode.window.showWarningMessage(
+            `Hareer: Linked PR but could not rename it — ${msg}`,
+          );
+        }
+      } else {
+        void vscode.window.showWarningMessage(
+          "Hareer: `gh` (GitHub CLI) not found — linked PR without applying the title convention.",
+        );
+      }
+    }
+
+    // 5. Store the PR URL on the ClickUp task.
+    await this.handleLinkPR(pr.url);
+  }
+
+  /** Native input-box fallback used when no GitHub submodule PRs are available. */
+  private async promptPastePRUrl(fieldName: string): Promise<void> {
+    if (!this.state) return;
+    const current = getLinkedPR(this.state.task, fieldName)?.url ?? "";
+    const url = await vscode.window.showInputBox({
+      prompt: "Paste the GitHub PR URL to link to this ClickUp task",
+      placeHolder: "https://github.com/owner/repo/pull/123",
+      value: current,
+      ignoreFocusOut: true,
+      validateInput: (v) =>
+        /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(v.trim())
+          ? undefined
+          : "Must be a GitHub PR URL",
+    });
+    if (!url) return;
+    await this.handleLinkPR(url.trim());
+  }
+
   private async handleLinkPR(url: string): Promise<void> {
     if (!this.state) return;
     const fieldName = vscode.workspace
@@ -1038,7 +1425,7 @@ export class TaskDetailPanel {
     if (!this.state) return;
     const auto = vscode.workspace
       .getConfiguration("hareer.clickup")
-      .get<boolean>("autoTransition", false);
+      .get<boolean>("autoTransition", true);
     if (!auto) return;
     if (this.state.task.status.status.toLowerCase() === targetStatus.toLowerCase()) return;
     const token = await getClickUpToken(this.context);
@@ -1065,6 +1452,7 @@ export class TaskDetailPanel {
     const task = this.state.task;
     void this.panel.webview.postMessage({
       type: "state",
+      discovering: this.discovering,
       task: {
         id: task.id,
         customId: task.customId ?? task.id,
@@ -1122,6 +1510,7 @@ export class TaskDetailPanel {
       branchMatches: this.state.branchMatches.map((b) => ({
         repoName: b.repoName,
         repoPath: b.repoPath,
+        checkedOut: b.checkedOut,
         branch: b.branch,
       })),
       prMatches: this.state.prMatches.map((p) => ({
@@ -1130,8 +1519,14 @@ export class TaskDetailPanel {
         repo: p.repo,
         prNumber: p.prNumber,
         headRef: p.headRef,
+        baseRef: p.baseRef,
         title: p.title,
         url: p.url,
+        state: p.state,
+        merged: p.merged,
+        mergeable: p.mergeable,
+        headBranchExists: p.headBranchExists,
+        deletable: p.deletable,
       })),
       cursorCommitGenerate: isCursorIDE(),
     });
@@ -1269,6 +1664,11 @@ async function ghPRCreate(
   return url;
 }
 
+/** Rename an existing PR (identified by URL or number) via `gh pr edit`. */
+async function ghPREdit(cwd: string, prRef: string, title: string): Promise<void> {
+  await runCommand("gh", ["pr", "edit", prRef, "--title", title], cwd);
+}
+
 async function fetchPRHeadRef(owner: string, repo: string, number: number): Promise<string> {
   const session = await vscode.authentication.getSession("github", ["repo"], { createIfNone: true });
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${number}`, {
@@ -1337,6 +1737,18 @@ body {
 }
 .error-banner button { margin-left: auto; }
 
+/* ------- Warning banner ------- */
+.warning-banner {
+  margin: 12px 0 4px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--hareer-warning) 12%, transparent);
+  color: var(--hareer-warning);
+  border: 1px solid color-mix(in srgb, var(--hareer-warning) 40%, transparent);
+  border-radius: 6px;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 0.85rem;
+}
+
 /* ------- Layout ------- */
 .task-layout {
   display: grid;
@@ -1393,6 +1805,9 @@ h2:first-child { margin-top: 0; }
 
 /* ------- Task action buttons (under description) ------- */
 .task-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.task-actions.actions-loading { align-items: center; gap: 10px; min-height: 30px; color: var(--vscode-descriptionForeground); font-size: 0.85rem; }
+.spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--vscode-foreground) 25%, transparent); border-top-color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); animation: hareer-spin 0.7s linear infinite; flex: none; }
+@keyframes hareer-spin { to { transform: rotate(360deg); } }
 .action-btn {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 6px 12px; border-radius: 12px; font-size: 0.78rem; font-weight: 600;
@@ -1405,6 +1820,10 @@ h2:first-child { margin-top: 0; }
 .action-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
 .action-btn .count { background: rgba(255,255,255,0.15); padding: 0 5px; border-radius: 8px; font-size: 0.7rem; }
 .action-btn.primary .count { background: rgba(255,255,255,0.25); }
+.action-btn.danger { background: color-mix(in srgb, var(--hareer-danger) 15%, transparent); color: var(--hareer-danger); border-color: color-mix(in srgb, var(--hareer-danger) 40%, transparent); }
+.action-btn.danger:hover { background: color-mix(in srgb, var(--hareer-danger) 25%, transparent); }
+.status-badge { cursor: pointer; }
+.status-badge:hover { opacity: 0.8; }
 .collapsible-section { margin-top: 8px; }
 
 /* ------- Description with fade + expand ------- */
@@ -1688,7 +2107,7 @@ function render() {
 
   const statusBg = 'color-mix(in srgb, ' + t.status.color + ' 14%, transparent)';
   const statusBorder = 'color-mix(in srgb, ' + t.status.color + ' 50%, transparent)';
-  const statusBadge = '<span class="status-badge" style="color:' + t.status.color + ';background:' + statusBg + ';border-color:' + statusBorder + '"><span class="status-dot" style="background:' + t.status.color + '"></span>' + escape(t.status.status) + '</span>';
+  const statusBadge = '<span class="status-badge" id="status-badge" title="Click to change status" style="color:' + t.status.color + ';background:' + statusBg + ';border-color:' + statusBorder + '"><span class="status-dot" style="background:' + t.status.color + '"></span>' + escape(t.status.status) + '</span>';
 
   const priorityBadge = t.priority
     ? '<span class="priority-pill" style="color:' + t.priority.color + ';border-color:color-mix(in srgb, ' + t.priority.color + ' 50%, transparent);background:color-mix(in srgb, ' + t.priority.color + ' 12%, transparent)">⚑ ' + escape(t.priority.priority) + '</span>'
@@ -1718,27 +2137,55 @@ function render() {
     : '<div class="empty">Not tracked</div>';
 
   // Context-driven action buttons (under description)
-  const branchCount = (model.branchMatches || []).length;
-  const prCount = (model.prMatches || []).length;
+  const branchMatches = model.branchMatches || [];
+  const branchCount = branchMatches.length;
+  // Repos with a matching branch that aren't already checked out to it.
+  const pendingCheckout = branchMatches.filter((b) => !b.checkedOut).length;
+  const allPRs = model.prMatches || [];
+  const openPRs = allPRs.filter((p) => p.state === 'open' && !p.merged);
+  const mergedPRs = allPRs.filter((p) => p.merged);
+  const conflictedPRs = openPRs.filter((p) => p.mergeable === false);
+  const openPRCount = openPRs.length;
+  const allMerged = allPRs.length > 0 && openPRCount === 0 && mergedPRs.length > 0;
+  const deletableBranches = allPRs.filter((p) => p.deletable);
   if (branchCount > 0) savedState.showBranchSection = false;
 
+  const conflictBannerHtml = conflictedPRs.length > 0
+    ? '<div class="warning-banner">⚠ ' + conflictedPRs.length + ' PR' + (conflictedPRs.length === 1 ? '' : 's') + ' have merge conflicts: ' + conflictedPRs.map((p) => escape(p.headRef)).join(', ') + '</div>'
+    : '';
+
   const actionBtns = [];
-  if (branchCount > 0) {
+  if (pendingCheckout > 0) {
+    // At least one matched repo isn't on its branch yet — offer checkout.
     actionBtns.push(
-      '<button class="action-btn primary" id="action-checkout" title="Checkout matching branch in ' + branchCount + ' repo' + (branchCount === 1 ? '' : 's') + '">' +
-        '⤓ Checkout' + (branchCount > 1 ? ' <span class="count">' + branchCount + '</span>' : '') +
+      '<button class="action-btn primary" id="action-checkout" title="Checkout matching branch in ' + pendingCheckout + ' repo' + (pendingCheckout === 1 ? '' : 's') + '">' +
+        '⤓ Checkout' + (pendingCheckout > 1 ? ' <span class="count">' + pendingCheckout + '</span>' : '') +
       '</button>',
     );
-  } else {
+  } else if (branchCount === 0) {
+    // No matching branch anywhere — offer to create one. (When branches exist
+    // and are all checked out, neither button shows.)
     actionBtns.push('<button class="action-btn primary" id="action-create-branch">＋ Create Branch</button>');
   }
-  if (branchCount > 0 && prCount === 0 && !linked) {
+  if (branchCount > 0 && openPRCount === 0 && !linked && !allMerged) {
     actionBtns.push('<button class="action-btn" id="action-create-pr">Create PR</button>');
   }
-  if (prCount > 0) {
+  if (openPRCount > 0) {
     actionBtns.push(
-      '<button class="action-btn primary" id="action-review" title="Open code review for ' + prCount + ' matching PR' + (prCount === 1 ? '' : 's') + '">' +
-        '👁 Code Review <span class="count">' + prCount + '</span>' +
+      '<button class="action-btn primary" id="action-review" title="Open code review for ' + openPRCount + ' matching PR' + (openPRCount === 1 ? '' : 's') + '">' +
+        '👁 Code Review <span class="count">' + openPRCount + '</span>' +
+      '</button>',
+    );
+    actionBtns.push(
+      '<button class="action-btn" id="action-merge-prs" title="Merge ' + openPRCount + ' PR' + (openPRCount === 1 ? '' : 's') + ' and mark ready to deploy">' +
+        '⤭ Merge' + (openPRCount > 1 ? ' <span class="count">' + openPRCount + '</span>' : '') +
+      '</button>',
+    );
+  }
+  if (allMerged && deletableBranches.length > 0) {
+    actionBtns.push(
+      '<button class="action-btn danger" id="action-delete-branches" title="Delete ' + deletableBranches.length + ' merged branch' + (deletableBranches.length === 1 ? '' : 'es') + '">' +
+        '🗑 Delete branches' + (deletableBranches.length > 1 ? ' <span class="count">' + deletableBranches.length + '</span>' : '') +
       '</button>',
     );
   }
@@ -1748,7 +2195,12 @@ function render() {
       (linked ? '🔗 Replace link' : '🔗 Link existing PR') +
     '</button>',
   );
-  const actionsHtml = '<div class="task-actions">' + actionBtns.join('') + '</div>';
+  const actionsHtml = model.discovering
+    ? '<div class="task-actions actions-loading">' +
+        '<span class="spinner" aria-hidden="true"></span>' +
+        '<span>Loading actions…</span>' +
+      '</div>'
+    : conflictBannerHtml + '<div class="task-actions">' + actionBtns.join('') + '</div>';
 
   // Determine which repos are selected for branch creation. Default: all submodules
   // (or the single workspace repo if no .gitmodules).
@@ -1987,6 +2439,12 @@ function bindEvents() {
   });
   const actionReview = document.getElementById("action-review");
   if (actionReview) actionReview.addEventListener("click", () => vscode.postMessage({ type: "openTaskReview" }));
+  const actionMergePRs = document.getElementById("action-merge-prs");
+  if (actionMergePRs) actionMergePRs.addEventListener("click", () => vscode.postMessage({ type: "mergeTaskPRs" }));
+  const actionDeleteBranches = document.getElementById("action-delete-branches");
+  if (actionDeleteBranches) actionDeleteBranches.addEventListener("click", () => vscode.postMessage({ type: "deleteTaskBranches" }));
+  const statusBadgeEl = document.getElementById("status-badge");
+  if (statusBadgeEl) statusBadgeEl.addEventListener("click", () => vscode.postMessage({ type: "changeStatus" }));
   const actionCommit = document.getElementById("action-commit");
   if (actionCommit) actionCommit.addEventListener("click", () => {
     savedState.showCommitSection = true;
@@ -1995,9 +2453,8 @@ function bindEvents() {
   });
   const actionLinkPR = document.getElementById("action-link-pr");
   if (actionLinkPR) actionLinkPR.addEventListener("click", () => {
-    const current = model && model.linkedPR ? model.linkedPR.url : "";
-    const url = prompt("Paste GitHub PR URL", current);
-    if (url) vscode.postMessage({ type: "linkPR", url: url.trim() });
+    // prompt() is disabled in VS Code webviews — let the host show a native input box.
+    vscode.postMessage({ type: "promptLinkPR" });
   });
 
   // Repo multi-select pills

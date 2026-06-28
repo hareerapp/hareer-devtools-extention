@@ -21,10 +21,24 @@ function resolveSubmodulePath(submodule: Submodule): string | undefined {
   return `${root}/${submodule.path}`;
 }
 
-/**
- * Fetches origin and checks out the PR's head branch inside the submodule
- * directory. Shows progress in a notification.
- */
+export function readBlobAtRef(
+  submodule: Submodule,
+  ref: string,
+  filePath: string,
+): Promise<string | undefined> {
+  const cwd = resolveSubmodulePath(submodule);
+  if (!cwd) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    execFile(
+      "git",
+      ["--no-pager", "show", `${ref}:${filePath}`],
+      { cwd, timeout: 30_000, maxBuffer: 64 * 1024 * 1024 },
+      (err, stdout) => resolve(err ? undefined : stdout),
+    );
+  });
+}
+
+
 export async function checkoutPRBranch(
   submodule: Submodule,
   headRef: string,

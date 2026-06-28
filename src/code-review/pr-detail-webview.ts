@@ -1,14 +1,7 @@
 import * as vscode from "vscode";
-import {
-  createIssueComment,
-  fetchPRChecks,
-  fetchPRComments,
-  fetchPRDetail,
-  fetchPRFiles,
-  fetchPRIssueComments,
-  fetchPRReviews,
-  mergePR,
-} from "./github-api";
+import { branchExists, createIssueComment, deleteBranch, isProtectedBranch, mergePR } from "./github-api";
+import { getPRBundle, invalidatePR } from "./pr-cache";
+import type { PRBundle } from "./pr-cache";
 import type {
   PRCheckRun,
   PRDetail,
@@ -32,6 +25,7 @@ interface PanelState {
   lineComments?: ReviewComment[];
   files?: PRFile[];
   checks?: PRCheckRun[];
+  headBranchExists?: boolean;
 }
 
 type InboundMessage =
@@ -41,7 +35,8 @@ type InboundMessage =
   | { type: "openFile"; filename: string }
   | { type: "postComment"; body: string }
   | { type: "submitReview"; event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT" }
-  | { type: "merge"; method: "merge" | "squash" | "rebase" };
+  | { type: "merge"; method: "merge" | "squash" | "rebase" }
+  | { type: "deleteBranch" };
 
 export interface PRDetailHostCallbacks {
   openFile(submodule: Submodule, prNumber: number, filename: string): Promise<void>;
@@ -122,20 +117,50 @@ export class PRDetailPanel {
     await this.refresh();
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(force = false): Promise<void> {
     const { submodule, prNumber } = this.state;
-    try {
-      const [detail, reviews, comments, files, lineComments] = await Promise.all([
-        fetchPRDetail(submodule.owner, submodule.repo, prNumber),
-        fetchPRReviews(submodule.owner, submodule.repo, prNumber),
-        fetchPRIssueComments(submodule.owner, submodule.repo, prNumber),
-        fetchPRFiles(submodule.owner, submodule.repo, prNumber),
-        fetchPRComments(submodule.owner, submodule.repo, prNumber),
-      ]);
-      const checks = await fetchPRChecks(submodule.owner, submodule.repo, detail.headSha);
-      this.state = { submodule, prNumber, detail, reviews, comments, lineComments, files, checks };
+
+    const applyBundle = async (b: PRBundle): Promise<void> => {
+      if (this.state.submodule.name !== submodule.name || this.state.prNumber !== prNumber) {
+        return;
+      }
+      let headBranchExists = true;
+      if (b.detail.merged) {
+        headBranchExists = await branchExists(submodule.owner, submodule.repo, b.detail.headRef).catch(() => true);
+        // Re-check after the awaited request: the user may have switched PRs while it was in flight.
+        if (this.state.submodule.name !== submodule.name || this.state.prNumber !== prNumber) {
+          return;
+        }
+      }
+      this.state = {
+        submodule,
+        prNumber,
+        detail: b.detail,
+        reviews: b.reviews,
+        comments: b.comments,
+        lineComments: b.lineComments,
+        files: b.files,
+        checks: b.checks,
+        headBranchExists,
+      };
       this.postState();
+    };
+
+    // Apply a bundle to the panel only if it's still showing the same PR.
+    const apply = (b: PRBundle): void => { void applyBundle(b); };
+
+    try {
+      // Cache hit paints instantly; a stale entry triggers the onUpdate repaint.
+      const bundle = await getPRBundle(
+        submodule.owner,
+        submodule.repo,
+        prNumber,
+        { force },
+        apply,
+      );
+      await applyBundle(bundle);
     } catch (err) {
+      if (this.state.detail) return; // keep showing cached data on a failed revalidate
       const msg = err instanceof Error ? err.message : String(err);
       void this.panel.webview.postMessage({ type: "error", message: msg });
     }
@@ -147,7 +172,8 @@ export class PRDetailPanel {
         if (this.state.detail) this.postState();
         return;
       case "refresh":
-        await this.refresh();
+        invalidatePR(this.state.submodule.owner, this.state.submodule.repo, this.state.prNumber);
+        await this.refresh(true);
         return;
       case "openExternal":
         await vscode.env.openExternal(vscode.Uri.parse(msg.url));
@@ -164,11 +190,41 @@ export class PRDetailPanel {
           this.state.prNumber,
           msg.event,
         );
-        await this.refresh();
+        invalidatePR(this.state.submodule.owner, this.state.submodule.repo, this.state.prNumber);
+        await this.refresh(true);
         return;
       case "merge":
         await this.handleMerge(msg.method);
         return;
+      case "deleteBranch":
+        await this.handleDeleteBranch();
+        return;
+    }
+  }
+
+  private async handleDeleteBranch(): Promise<void> {
+    const { detail, submodule, prNumber } = this.state;
+    if (!detail) return;
+    if (isProtectedBranch(detail.headRef, detail.baseRef)) {
+      void vscode.window.showWarningMessage(
+        `Hareer: ${detail.headRef} is a base branch and won't be deleted.`,
+      );
+      return;
+    }
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete branch ${detail.headRef}? This can't be undone from here (GitHub can restore it).`,
+      { modal: true },
+      "Delete branch",
+    );
+    if (confirmed !== "Delete branch") return;
+    try {
+      await deleteBranch(submodule.owner, submodule.repo, detail.headRef);
+      invalidatePR(submodule.owner, submodule.repo, prNumber);
+      void vscode.window.showInformationMessage(`Hareer: Deleted branch ${detail.headRef}.`);
+      await this.refresh(true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      void vscode.window.showErrorMessage(`Hareer: Could not delete ${detail.headRef} — ${msg}`);
     }
   }
 
@@ -183,7 +239,8 @@ export class PRDetailPanel {
         trimmed,
       );
       void vscode.window.showInformationMessage("Hareer: Comment posted.");
-      await this.refresh();
+      invalidatePR(this.state.submodule.owner, this.state.submodule.repo, this.state.prNumber);
+      await this.refresh(true);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Hareer: Failed to post comment — ${msg}`);
@@ -204,7 +261,8 @@ export class PRDetailPanel {
       void vscode.window.showInformationMessage(
         `Hareer: PR #${prNumber} merged into ${detail.baseRef} ✓`,
       );
-      await this.refresh();
+      invalidatePR(submodule.owner, submodule.repo, prNumber);
+      await this.refresh(true);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Hareer: Failed to merge — ${msg}`);
@@ -222,6 +280,8 @@ export class PRDetailPanel {
       lineComments: lineComments ?? [],
       files: files ?? [],
       checks: checks ?? [],
+      canDeleteBranch:
+        detail.merged && (this.state.headBranchExists ?? true) && !isProtectedBranch(detail.headRef, detail.baseRef),
     });
   }
 
@@ -858,6 +918,16 @@ function render() {
             '</div>' +
           '</div>'
         ) : '') +
+
+        (model.canDeleteBranch ? (
+          '<div class="merge-box">' +
+            '<div class="merge-title">Branch cleanup</div>' +
+            '<div class="merge-status">This PR is merged. You can delete the head branch <span class="branch-ref">' + escape(d.headRef) + '</span>.</div>' +
+            '<div class="merge-actions">' +
+              '<button class="danger" id="delete-branch">🗑 Delete branch</button>' +
+            '</div>' +
+          '</div>'
+        ) : '') +
       '</div>' +
 
       '<div class="sidebar">' +
@@ -919,6 +989,8 @@ function bindEvents() {
   document.querySelectorAll('[data-merge]').forEach((btn) => {
     btn.addEventListener('click', () => vscode.postMessage({ type: 'merge', method: btn.getAttribute('data-merge') }));
   });
+  const deleteBranchBtn = document.getElementById('delete-branch');
+  if (deleteBranchBtn) deleteBranchBtn.addEventListener('click', () => vscode.postMessage({ type: 'deleteBranch' }));
   const refresh = document.getElementById('refresh-btn');
   if (refresh) refresh.addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
 

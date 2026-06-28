@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
-import { fetchOpenPRs, fetchPRFiles } from "./github-api";
+import { getOpenPRs, getPRFiles } from "./pr-cache";
+import { fetchPRComments } from "./github-api";
 import { checkoutPRBranch } from "./git-checkout";
 import type { PRFile, PullRequest, Submodule } from "./types";
 
@@ -56,6 +57,20 @@ interface SubmoduleState {
   files: PRFile[];
   folderTree: FolderTree;
   loading: boolean;
+  /** Review-comment count per file path, loaded with the PR. */
+  commentCounts: Map<string, number>;
+}
+
+/** A submodule's state with no PR selected — the single source of truth for
+ *  both first-time init and clearing an existing selection. */
+function emptySubmoduleState(): SubmoduleState {
+  return {
+    selectedPR: undefined,
+    files: [],
+    folderTree: { folders: new Map(), files: [] },
+    loading: false,
+    commentCounts: new Map(),
+  };
 }
 
 export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNode> {
@@ -92,6 +107,34 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     return this.state.get(submodule.name)?.selectedPR;
   }
 
+  clearSelectionsExcept(
+    keep: ReadonlyArray<{ submoduleName: string; prNumber: number }>,
+  ): void {
+    const keepKeys = new Set(keep.map((k) => `${k.submoduleName}#${k.prNumber}`));
+    let changed = false;
+    for (const [name, st] of this.state) {
+      if (!st.selectedPR) continue;
+      if (keepKeys.has(`${name}#${st.selectedPR.number}`)) continue;
+      this.state.set(name, emptySubmoduleState());
+      changed = true;
+    }
+    if (changed) {
+      this.updateHasSelectionContext();
+      this._onDidChangeTreeData.fire(undefined);
+    }
+  }
+  clearAllSelections(): void {
+    this.clearSelectionsExcept([]);
+  }
+  private updateHasSelectionContext(): void {
+    const has = [...this.state.values()].some((st) => st.selectedPR !== undefined);
+    void vscode.commands.executeCommand(
+      "setContext",
+      "hareer.codeReview.hasSelection",
+      has,
+    );
+  }
+
   async selectPR(submodule: Submodule): Promise<void> {
     const st = this.ensureState(submodule);
     st.loading = true;
@@ -99,7 +142,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
     let prs: PullRequest[];
     try {
-      prs = await fetchOpenPRs(submodule.owner, submodule.repo);
+      prs = await getOpenPRs(submodule.owner, submodule.repo);
     } catch (err) {
       st.loading = false;
       this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
@@ -174,7 +217,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
     let files: PRFile[];
     try {
-      files = await fetchPRFiles(submodule.owner, submodule.repo, selectedPR.number);
+      files = await getPRFiles(submodule.owner, submodule.repo, selectedPR.number);
     } catch (err) {
       st.loading = false;
       this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
@@ -186,8 +229,11 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     st.selectedPR = selectedPR;
     st.files = files;
     st.folderTree = buildFolderTree(files);
+    st.commentCounts = new Map();
     st.loading = false;
+    this.updateHasSelectionContext();
     this._onDidChangeTreeData.fire(undefined);
+    void this.loadCommentCounts(submodule, selectedPR.number);
 
     // Open the PR detail panel immediately; don't make the user click the row.
     this.onPRSelected(submodule, selectedPR);
@@ -195,12 +241,6 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     await checkoutPRBranch(submodule, selectedPR.headRef);
   }
 
-  /**
-   * Select a specific PR without the QuickPick. Used when the caller already
-   * knows the PR number (e.g. driven from the Task Manager "Code Review" button).
-   * Pass `openDetail=false` to display the PR only inside the Code Review tree
-   * without opening the standalone PR detail webview panel.
-   */
   async selectPRByNumber(
     submodule: Submodule,
     prNumber: number,
@@ -224,7 +264,7 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
 
     let files: PRFile[];
     try {
-      files = await fetchPRFiles(submodule.owner, submodule.repo, prNumber);
+      files = await getPRFiles(submodule.owner, submodule.repo, prNumber);
     } catch (err) {
       st.loading = false;
       this._onDidChangeTreeData.fire({ kind: "prSelector", submodule });
@@ -236,11 +276,11 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     st.selectedPR = pr;
     st.files = files;
     st.folderTree = buildFolderTree(files);
+    st.commentCounts = new Map();
     st.loading = false;
+    this.updateHasSelectionContext();
     this._onDidChangeTreeData.fire(undefined);
-
-    // Reveal the PR row in the tree.
-    void this._onDidChangeTreeData.fire(undefined);
+    void this.loadCommentCounts(submodule, pr.number);
 
     if (openDetail) {
       this.onPRSelected(submodule, pr);
@@ -248,15 +288,31 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
     await checkoutPRBranch(submodule, pr.headRef);
   }
 
+  /**
+   * Fetch the PR's review comments once and tally them per file path so the
+   * tree can show a count on each file without the user opening it. Non-blocking
+   * and best-effort — runs after the PR's files are already shown.
+   */
+  private async loadCommentCounts(submodule: Submodule, prNumber: number): Promise<void> {
+    try {
+      const comments = await fetchPRComments(submodule.owner, submodule.repo, prNumber);
+      const counts = new Map<string, number>();
+      for (const c of comments) {
+        counts.set(c.path, (counts.get(c.path) ?? 0) + 1);
+      }
+      const st = this.state.get(submodule.name);
+      if (!st || st.selectedPR?.number !== prNumber) return; // a newer PR was selected
+      st.commentCounts = counts;
+      this._onDidChangeTreeData.fire(undefined);
+    } catch {
+      /* leave counts empty on failure */
+    }
+  }
+
   private ensureState(submodule: Submodule): SubmoduleState {
     let st = this.state.get(submodule.name);
     if (!st) {
-      st = {
-        selectedPR: undefined,
-        files: [],
-        folderTree: { folders: new Map(), files: [] },
-        loading: false,
-      };
+      st = emptySubmoduleState();
       this.state.set(submodule.name, st);
     }
     return st;
@@ -304,7 +360,8 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
           item.description =
             pendingCount > 0 ? `${baseDesc}  ·  ${pendingCount} pending` : baseDesc;
           item.tooltip = selectedPR.url;
-          item.contextValue = pendingCount > 0 ? "prSelectorActivePending" : "prSelectorActive";
+          const prStateSuffix = selectedPR.state === "open" ? "Open" : "Closed";
+          item.contextValue = pendingCount > 0 ? `prSelectorActivePending${prStateSuffix}` : `prSelectorActive${prStateSuffix}`;
           item.command = {
             command: "hareer.openPRDetail",
             title: "Open Pull Request",
@@ -344,8 +401,13 @@ export class CodeReviewProvider implements vscode.TreeDataProvider<CodeReviewNod
         const fileName = file.filename.split("/").pop() ?? file.filename;
         const item = new vscode.TreeItem(fileName, vscode.TreeItemCollapsibleState.None);
         item.iconPath = fileStatusIcon(file.status);
-        item.description = fileStatusLabel(file.status);
-        item.tooltip = file.filename;
+        const commentCount = this.state.get(node.submodule.name)?.commentCounts.get(file.filename) ?? 0;
+        const statusLabel = fileStatusLabel(file.status);
+        item.description = commentCount > 0 ? `${statusLabel} · 💬 ${commentCount}` : statusLabel;
+        item.tooltip =
+          commentCount > 0
+            ? `${file.filename} — ${commentCount} comment${commentCount === 1 ? "" : "s"}`
+            : file.filename;
         item.contextValue = "file";
         item.command = {
           command: "hareer.openDiff",

@@ -3,7 +3,8 @@
 	help \
 	install \
 	build compile watch typecheck clean \
-	run run-extension package
+	run run-extension package \
+	install-cursor install-vscode
 
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
@@ -12,18 +13,23 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
+# Derive the latest .vsix in release/ by modification time
+LATEST_VSIX = $(shell ls -t "$(ROOT)/release"/*.vsix 2>/dev/null | head -1)
+
 help:
 	@printf '%s\n' \
 		'' \
 		'vscode-extension Makefile ($(ROOT))' \
 		'' \
-		'  make install          bun install dependencies' \
-		'  make build            compile TypeScript → dist/' \
-		'  make watch            watch mode compile' \
-		'  make typecheck        tsc --noEmit' \
-		'  make clean            remove dist/' \
-		'  make run              open Extension Development Host (code or cursor)' \
-		'  make package          build .vsix with @vscode/vsce' \
+		'  make install            bun install dependencies' \
+		'  make build              compile TypeScript → dist/' \
+		'  make watch              watch mode compile' \
+		'  make typecheck          tsc --noEmit' \
+		'  make clean              remove dist/' \
+		'  make run                open Extension Development Host (code or cursor)' \
+		'  make package            build .vsix → release/' \
+		'  make install-cursor     install latest release into Cursor' \
+		'  make install-vscode     install latest release into VS Code' \
 		''
 
 install:
@@ -52,4 +58,20 @@ run run-extension:
 	fi
 
 package:
-	@cd "$(ROOT)" && bun run compile && bunx --bun @vscode/vsce package
+	@cd "$(ROOT)" && bun run compile && bunx --bun @vscode/vsce package --out "$(ROOT)/release/"
+	@echo "Packaged → release/"
+	@ls -1 "$(ROOT)/release/"
+
+install-cursor:
+	@if [ -z "$(LATEST_VSIX)" ]; then \
+		echo "No .vsix found in release/. Run 'make package' first." >&2; exit 1; \
+	fi
+	@cursor --install-extension "$(LATEST_VSIX)" --force
+	@echo "Installed successfully — please reload the Cursor window"
+
+install-vscode:
+	@if [ -z "$(LATEST_VSIX)" ]; then \
+		echo "No .vsix found in release/. Run 'make package' first." >&2; exit 1; \
+	fi
+	@code --install-extension "$(LATEST_VSIX)" --force
+	@echo "Installed successfully — please reload the VS Code window"

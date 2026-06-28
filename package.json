@@ -2,7 +2,7 @@
   "name": "hareer-devtools",
   "displayName": "Hareer DevTools",
   "description": "ClickUp task manager, code review, and Makefile runner for the Hareer monorepo.",
-  "version": "0.3.0",
+  "version": "0.5.7",
   "publisher": "Hareer-Team",
   "private": true,
   "repository": {
@@ -45,6 +45,11 @@
         "command": "hareer.refreshCodeReview",
         "title": "Hareer: Refresh Code Review",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "hareer.clearCodeReview",
+        "title": "Hareer: Clear Code Review",
+        "icon": "$(clear-all)"
       },
       {
         "command": "hareer.reconnectGitHub",
@@ -117,6 +122,16 @@
       {
         "command": "hareer.openTaskDetail",
         "title": "Hareer: Open Task Detail"
+      },
+      {
+        "command": "hareer.filterTasks",
+        "title": "Hareer: Filter Tasks",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "hareer.clearTaskFilters",
+        "title": "Hareer: Clear Task Filters",
+        "icon": "$(clear-all)"
       }
     ],
     "viewsContainers": {
@@ -159,9 +174,14 @@
           "group": "navigation"
         },
         {
+          "command": "hareer.clearCodeReview",
+          "when": "view == hareerCodeReview && hareer.codeReview.hasSelection",
+          "group": "navigation@1"
+        },
+        {
           "command": "hareer.refreshCodeReview",
           "when": "view == hareerCodeReview",
-          "group": "navigation"
+          "group": "navigation@2"
         },
         {
           "command": "hareer.refreshTasks",
@@ -169,9 +189,19 @@
           "group": "navigation@1"
         },
         {
-          "command": "hareer.switchClickUpWorkspace",
+          "command": "hareer.filterTasks",
           "when": "view == hareerTaskManager && hareer.clickup.connected",
           "group": "navigation@2"
+        },
+        {
+          "command": "hareer.clearTaskFilters",
+          "when": "view == hareerTaskManager && hareer.clickup.connected && hareer.tasks.filtered",
+          "group": "navigation@3"
+        },
+        {
+          "command": "hareer.switchClickUpWorkspace",
+          "when": "view == hareerTaskManager && hareer.clickup.connected",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -187,12 +217,12 @@
         },
         {
           "command": "hareer.discardReview",
-          "when": "view == hareerCodeReview && viewItem == prSelectorActivePending",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActivePending/",
           "group": "inline@3"
         },
         {
           "command": "hareer.mergePR",
-          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive/",
+          "when": "view == hareerCodeReview && viewItem =~ /prSelectorActive.*Open/",
           "group": "inline@4"
         }
       ],
@@ -233,8 +263,8 @@
         },
         "hareer.clickup.autoTransition": {
           "type": "boolean",
-          "default": false,
-          "description": "Automatically move ClickUp tasks between statuses when you create branches and push."
+          "default": true,
+          "description": "Automatically move ClickUp tasks between statuses: to \"in progress\" when you create a branch, to \"in review\" when a PR is linked, and back to \"in progress\" when a reviewer requests changes or leaves a comment review."
         },
         "hareer.clickup.branchTypes": {
           "type": "array",

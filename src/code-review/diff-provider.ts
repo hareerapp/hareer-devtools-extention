@@ -3,8 +3,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { fetchFileContent } from "./github-api";
+import { readBlobAtRef } from "./git-checkout";
 import type { CodeReviewNode } from "./code-review-provider";
 import type { PRFile, PullRequest, Submodule } from "./types";
+
+async function loadContent(
+  submodule: Submodule,
+  ref: string,
+  filePath: string,
+): Promise<string> {
+  const local = await readBlobAtRef(submodule, ref, filePath);
+  if (local !== undefined) return local;
+  return fetchFileContent(submodule.owner, submodule.repo, filePath, ref);
+}
 
 const tempFiles = new Set<string>();
 
@@ -51,20 +62,19 @@ export async function openDiff(
       cancellable: false,
     },
     async () => {
+      const baseFilename =
+        file.status === "renamed" && file.previousFilename
+          ? file.previousFilename
+          : file.filename;
+      const headFilename = file.filename;
+
       const [baseContent, headContent] = await Promise.all([
         file.status === "added"
           ? Promise.resolve("")
-          : fetchFileContent(submodule.owner, submodule.repo, file.filename, pr.baseSha),
+          : loadContent(submodule, pr.baseSha, baseFilename),
         file.status === "removed"
           ? Promise.resolve("")
-          : fetchFileContent(
-              submodule.owner,
-              submodule.repo,
-              file.status === "renamed" && file.previousFilename
-                ? file.previousFilename
-                : file.filename,
-              pr.headSha,
-            ),
+          : loadContent(submodule, pr.headSha, headFilename),
       ]);
 
       const safeName = sanitizePath(file.filename);
@@ -76,8 +86,6 @@ export async function openDiff(
       const baseUri = vscode.Uri.file(baseFile);
       const headUri = vscode.Uri.file(headFile);
 
-      // Register comments BEFORE opening the diff so provideCommentingRanges
-      // sees the URI when VS Code queries it during editor activation.
       await onBeforeDiffOpen(submodule, pr, file, pr.headSha, headUri);
 
       const title = `${path.basename(file.filename)} (${pr.baseRef} ↔ ${pr.headRef})`;

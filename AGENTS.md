@@ -27,6 +27,23 @@ make package
 bun run compile && bunx --bun @vscode/vsce package
 ```
 
+## Releasing
+
+When bumping the version (any change worth shipping), do **all** of these in order —
+**never skip the changelog**:
+
+1. **Add a `CHANGELOG.md` entry** — a new `## [x.y.z] - YYYY-MM-DD` section at the
+   **top**, under the intro block. Group changes under `### Added` / `### Changed` /
+   `### Fixed` / `### Removed` ([Keep a Changelog](https://keepachangelog.com)).
+   Never edit already-released sections; only add above them.
+2. **Bump `version`** in `package.json` to the same `x.y.z`.
+3. **`make package`** — builds the `.vsix` into `release/` (changelog bundled).
+4. **Commit**, then **`git tag vX.Y.Z`**.
+
+The changelog entry must be written **before** packaging so the `.vsix` ships those
+notes. `package.json` `version`, the top `CHANGELOG.md` heading, and the git tag must
+always match.
+
 ## Behaviour
 
 - Resolves **`Makefile`** in the workspace: first workspace folder with a `./Makefile`; otherwise first match via `**/Makefile`.

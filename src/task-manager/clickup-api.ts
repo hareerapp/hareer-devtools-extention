@@ -24,8 +24,8 @@ export class ClickUpApiError extends Error {
 
 interface RawUser {
   id: number;
-  username: string;
-  email: string;
+  username: string | null;
+  email: string | null;
   color?: string;
   profilePicture?: string;
 }
@@ -168,10 +168,12 @@ function request<T>(
 }
 
 function mapUser(raw: RawUser): ClickUpUser {
+  // ClickUp returns username: null for members invited but not yet onboarded;
+  const email = raw.email ?? "";
   return {
     id: raw.id,
-    username: raw.username,
-    email: raw.email,
+    username: raw.username || email || "Unknown",
+    email,
     color: raw.color,
     profilePicture: raw.profilePicture,
   };

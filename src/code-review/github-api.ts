@@ -20,6 +20,8 @@ const BASE_URL = "api.github.com";
 
 let cachedToken: string | undefined;
 
+const fileContentCache = new Map<string, string>();
+
 async function getToken(): Promise<string> {
   if (cachedToken) return cachedToken;
   const session = await vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_SCOPES, {
@@ -33,10 +35,6 @@ export function invalidateToken(): void {
   cachedToken = undefined;
 }
 
-/**
- * Force a fresh GitHub sign-in dialog. Use this when the cached session was
- * granted with insufficient scopes (e.g. no access to private repos).
- */
 export async function reconnectGitHub(): Promise<void> {
   cachedToken = undefined;
   const session = await vscode.authentication.getSession(
@@ -153,6 +151,7 @@ interface RawPR {
   number: number;
   title: string;
   state: string;
+  merged_at: string | null;
   html_url: string;
   head: { sha: string; ref: string };
   base: { sha: string; ref: string };
@@ -198,12 +197,65 @@ export async function fetchOpenPRs(owner: string, repo: string): Promise<PullReq
     number: pr.number,
     title: pr.title,
     state: "open",
+    merged: false,
     headSha: pr.head.sha,
     baseSha: pr.base.sha,
     headRef: pr.head.ref,
     baseRef: pr.base.ref,
     url: pr.html_url,
   }));
+}
+
+const PR_PAGE_SIZE = 100;
+/** Cap pagination so a large monorepo can't trigger an unbounded request fan-out. */
+const MAX_PR_PAGES = 10;
+
+export async function fetchAllPRs(owner: string, repo: string): Promise<PullRequest[]> {
+  const token = await getToken();
+  // `state=all` can span thousands of PRs in an active repo; the GitHub list endpoint
+  // only returns one page at a time. Walk pages (newest first) until a short page signals
+  // the end, bounded by MAX_PR_PAGES so the discovery never fans out without limit.
+  const all: RawPR[] = [];
+  for (let page = 1; page <= MAX_PR_PAGES; page++) {
+    const raw = await githubRequest<RawPR[]>(
+      "GET",
+      `/repos/${owner}/${repo}/pulls?state=all&per_page=${PR_PAGE_SIZE}&page=${page}`,
+      token,
+    );
+    all.push(...raw);
+    if (raw.length < PR_PAGE_SIZE) break;
+  }
+  return all.map((pr) => ({
+    number: pr.number,
+    title: pr.title,
+    state: pr.state === "open" ? "open" : "closed",
+    merged: Boolean(pr.merged_at),
+    headSha: pr.head.sha,
+    baseSha: pr.base.sha,
+    headRef: pr.head.ref,
+    baseRef: pr.base.ref,
+    url: pr.html_url,
+  }));
+}
+
+export async function branchExists(
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<boolean> {
+  const token = await getToken();
+  const encoded = encodeURIComponent(branch).replace(/%2F/g, "/");
+  try {
+    await githubRequest<unknown>(
+      "GET",
+      `/repos/${owner}/${repo}/branches/${encoded}`,
+      token,
+    );
+    return true;
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("404")) return false;
+    throw err;
+  }
 }
 
 export async function fetchPRByNumber(
@@ -217,6 +269,7 @@ export async function fetchPRByNumber(
     number: pr.number,
     title: pr.title,
     state: pr.state === "open" ? "open" : "closed",
+    merged: Boolean(pr.merged_at),
     headSha: pr.head.sha,
     baseSha: pr.base.sha,
     headRef: pr.head.ref,
@@ -309,6 +362,10 @@ export async function fetchFileContent(
   filePath: string,
   ref: string,
 ): Promise<string> {
+  const cacheKey = `${owner}/${repo}/${ref}/${filePath}`;
+  const cached = fileContentCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const token = await getToken();
   const encodedPath = encodeURIComponent(filePath).replace(/%2F/g, "/");
   const encodedRef = encodeURIComponent(ref);
@@ -318,10 +375,13 @@ export async function fetchFileContent(
       `/repos/${owner}/${repo}/contents/${encodedPath}?ref=${encodedRef}`,
       token,
     );
-    if (raw.encoding === "base64") {
-      return Buffer.from(raw.content.replace(/\n/g, ""), "base64").toString("utf-8");
-    }
-    return raw.content;
+    const content =
+      raw.encoding === "base64"
+        ? Buffer.from(raw.content.replace(/\n/g, ""), "base64").toString("utf-8")
+        : raw.content;
+
+    fileContentCache.set(cacheKey, content);
+    return content;
   } catch {
     return "";
   }
@@ -690,4 +750,35 @@ export async function mergePR(
     token,
     { merge_method: mergeMethod },
   );
+}
+
+/** Delete a branch (its ref) on GitHub — used to clean up a PR head after merge. */
+export async function deleteBranch(
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<void> {
+  const token = await getToken();
+  const encoded = encodeURIComponent(branch).replace(/%2F/g, "/");
+  await githubRequest<unknown>(
+    "DELETE",
+    `/repos/${owner}/${repo}/git/refs/heads/${encoded}`,
+    token,
+  );
+}
+
+const CONVENTIONAL_BASE_BRANCHES = ["develop", "staging", "main", "master"];
+
+
+export function isProtectedBranch(branch: string, baseRef?: string): boolean {
+  const name = branch.trim().toLowerCase();
+  if (name.length === 0) return true;
+  if (baseRef && name === baseRef.trim().toLowerCase()) return true;
+  const configured = vscode.workspace
+    .getConfiguration("hareer.git")
+    .get<string[]>("baseBranches", ["develop", "staging", "main"]);
+  const protectedNames = new Set(
+    [...CONVENTIONAL_BASE_BRANCHES, ...configured].map((b) => b.toLowerCase()),
+  );
+  return protectedNames.has(name);
 }
